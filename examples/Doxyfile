@@ -1,0 +1,25 @@
+# Run from the repository/release root: doxygen examples\Doxyfile
+PROJECT_NAME           = "Pas2Dox Modern example"
+PROJECT_BRIEF          = "Synthetic cross-unit calls and Delphi TODO comments"
+INPUT                  = examples
+RECURSIVE              = YES
+FILE_PATTERNS          = *.pas
+INPUT_ENCODING         = UTF-8
+INPUT_FILTER           = "build\pas2dox.exe --delphi=11 --platform=win64"
+FILTER_SOURCE_FILES    = YES
+EXTENSION_MAPPING      = pas=C++
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = YES
+OUTPUT_DIRECTORY       = build/example-docs
+GENERATE_HTML          = YES
+GENERATE_XML           = YES
+GENERATE_LATEX         = YES
+GENERATE_TODOLIST       = YES
+CALL_GRAPH             = YES
+CALLER_GRAPH           = YES
+HAVE_DOT               = YES
+DOT_NUM_THREADS        = 2
+DOT_IMAGE_FORMAT       = png
+DOT_GRAPH_MAX_NODES    = 100
+QUIET                  = YES
+WARN_LOGFILE           = build/example-warnings.txt

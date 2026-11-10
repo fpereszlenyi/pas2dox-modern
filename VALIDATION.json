@@ -1,0 +1,36 @@
+{
+  "version": "0.60.0-rc4",
+  "date": "2026-11-10",
+  "executable_platform": "Windows x64",
+  "compiler": "Delphi 11 dcc64 35.0",
+  "doxygen": "1.18.0 (8e760943e5d9581a444cf327f43a0b4d20d29482)",
+  "graphviz": "dot - graphviz version 7.1.0 (20230121.1956)",
+  "python": "3.11.2",
+  "executable_sha256": "cb07e5cf964f8d3382745ca077347690835ac920e63caf2ac54e6b25c1554390",
+  "tests": {
+    "total": 67,
+    "modern": 47,
+    "native_graph": 9,
+    "delphi_todo": 11,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "example": {
+    "doxygen_warnings": 0,
+    "cross_unit_graphs": true,
+    "both_graph_directions": true,
+    "latex_pdf_graph_assets": true,
+    "delphi_todos": 2,
+    "delphi11_compile": true,
+    "in_memory_console_run": "Stored value: 42"
+  },
+  "delphi11_positive_fixture_compiled": true,
+  "not_verified": [
+    "Delphi 12/13/13.2 compiler execution",
+    "Other Doxygen/Graphviz versions",
+    "Non-Windows binaries",
+    "Complete runtime/dynamic call traces",
+    "Complete LaTeX manual compilation"
+  ]
+}

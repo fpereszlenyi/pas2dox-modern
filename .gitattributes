@@ -1,0 +1,14 @@
+* text=auto eol=lf
+*.pas text eol=lf
+*.dpr text eol=lf
+*.inc text eol=lf
+*.md text eol=lf
+*.py text eol=lf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.png binary
+*.exe binary
+*.zip binary
+# Unified patches need their context spaces; keep the upstream EOF unchanged.
+*.patch text eol=lf -whitespace
+source/pasdoc/pasdoc_versions.inc -whitespace

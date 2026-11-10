@@ -1,0 +1,12 @@
+/build/
+/dist/
+__pycache__/
+*.pyc
+*.dcu
+*.obj
+*.map
+*.rsm
+*.dsk
+*.local
+__history/
+__recovery/

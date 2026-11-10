@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/pasdoc/pasdoc",
+  "revision": "dbc50ba9ecb05b38d82855f0659b4dc2b827e242",
+  "original_modified_file_sha256": {
+    "PasDoc_Items.pas": "363beec5a0d3b4e71a01f1233510eef4be803de5fa4d12135b26e7b6f84357a9",
+    "PasDoc_Parser.pas": "e95bbfcc4e6966d873fa45b490e844021a983404eee9b118ecae13efda115fed",
+    "PasDoc_Scanner.pas": "feef56150f04d15fa5cc566a24b67f10f5efb93c385daea9f40ee7ca0db0e1c4",
+    "PasDoc_Tokenizer.pas": "846240f5d5339cc73bc719518e589c4a6cd442531bcecad89322d8e1d2878f23"
+  }
+}

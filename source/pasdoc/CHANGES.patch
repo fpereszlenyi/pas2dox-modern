@@ -1,0 +1,1404 @@
+--- a/PasDoc_Items.pas
++++ b/PasDoc_Items.pas
+@@ -1,3 +1,4 @@
++{ Pas2Dox modification 2026-11-10. See ORIGIN.md. }
+ {
+   Copyright 1998-2026 PasDoc developers.
+ 
+@@ -369,6 +370,8 @@
+     FParams: TStringPairVector;
+     FSourceAbsoluteFileName: string;
+     FSourceLine: Integer;
++    FSourceRootLine: Integer;
++    FSourceEndLine: Integer;
+     FRaises: TStringPairVector;
+ 
+     procedure StoreAbstractTag(ThisTag: TTag; var ThisTagData: TObject;
+@@ -609,6 +612,8 @@
+     { Source line number (1-based) where this item is declared.
+       Set by the parser when parsing the item's declaration. }
+     property SourceLine: Integer read FSourceLine write FSourceLine;
++    property SourceRootLine: Integer read FSourceRootLine write FSourceRootLine;
++    property SourceEndLine: Integer read FSourceEndLine write FSourceEndLine;
+   end;
+ 
+   { @abstract(Pascal constant.)
+@@ -681,6 +686,7 @@
+   TPasEnum = class(TPasType)
+   protected
+     FMembers: TPasItems;
++    FScoped: Boolean;
+     procedure Serialize(const ADestination: TStream); override;
+     procedure Deserialize(const ASource: TStream); override;
+     procedure StoreValueTag(ThisTag: TTag; var ThisTagData: TObject;
+@@ -695,6 +701,7 @@
+     destructor Destroy; override;
+     constructor Create; override;
+     property Members: TPasItems read FMembers;
++    property Scoped: Boolean read FScoped write FScoped;
+   end;
+ 
+   { Routine type for @link(TPasRoutine.What) }
+@@ -713,6 +720,7 @@
+     FWhat: TRoutineType;
+     FDirectives: TStandardDirectives;
+     FParamTypes: TStringVector;
++    FBodyTokens: TStringVector;
+     FIsType: Boolean;
+     procedure Serialize(const ADestination: TStream); override;
+     procedure Deserialize(const ASource: TStream); override;
+@@ -746,6 +754,10 @@
+     property Directives: TStandardDirectives read FDirectives write FDirectives;
+ 
+     property ParamTypes: TStringVector read FParamTypes write FParamTypes;
++    property BodyTokens: TStringVector read FBodyTokens;
++  public
++    BodyLine: Integer;
++    DeferredBlocks: Integer;
+ 
+     function HasOptionalInfo: boolean; override;
+ 
+@@ -1057,6 +1069,14 @@
+ 
+     Note: Remember to always set @link(CacheDateTime) after
+     deserializing this unit. }
++  { Transient source TODO metadata for the Doxygen filter (not serialized). }
++  TPasSourceTodo = class
++  public
++    Text, SourceFile: string;
++    Line: Integer;
++    Owner: TPasRoutine; // Non-owning; nil means unit-level source comment.
++  end;
++
+   TPasUnit = class(TPasItem)
+   strict private
+     FTypes: TPasTypes;
+@@ -1065,6 +1085,7 @@
+     FConstants: TPasItems;
+     FFuncsProcs: TPasRoutines;
+     FUsesUnits: TStringVector;
++    FSourceTodos: TObjectList<TPasSourceTodo>;
+     FSourceFilename: string;
+     FOutputFileName: string;
+     FCacheDateTime: TDateTime;
+@@ -1108,6 +1129,7 @@
+       In other words, you will be able to use UsesUnits.Objects[i] to
+       obtain given unit's instance, as parsed by pasdoc. }
+     property UsesUnits: TStringVector read FUsesUnits;
++    property SourceTodos: TObjectList<TPasSourceTodo> read FSourceTodos;
+ 
+     { list of types defined in this unit }
+     property Types: TPasTypes read FTypes;
+@@ -2795,10 +2817,12 @@
+   FConstants := TPasItems.Create(True);
+   FFuncsProcs := TPasRoutines.Create(True);
+   FUsesUnits := TStringVector.Create;
++  FSourceTodos := TObjectList<TPasSourceTodo>.Create(True);
+ end;
+ 
+ destructor TPasUnit.Destroy;
+ begin
++  FSourceTodos.Free;
+   FCIOs.Free;
+   FConstants.Free;
+   FFuncsProcs.Free;
+@@ -3022,11 +3046,13 @@
+ begin
+   inherited;
+   FParamTypes := TStringVector.Create;
++  FBodyTokens := TStringVector.Create;
+ end;
+ 
+ destructor TPasRoutine.Destroy;
+ begin
+   FreeAndNil(FParamTypes);
++  FreeAndNil(FBodyTokens);
+   inherited Destroy;
+ end;
+ 
+--- a/PasDoc_Parser.pas
++++ b/PasDoc_Parser.pas
+@@ -1,3 +1,4 @@
++{ Pas2Dox modification 2026-11-10. See ORIGIN.md. }
+ {
+   Copyright 1998-2026 PasDoc developers.
+ 
+@@ -170,6 +171,9 @@
+       TPasItem.SourceAbsoluteFileName and TPasItem.SourceLine. }
+     FLastParsedTokenStreamAbsoluteFileName: string;
+     FLastParsedTokenLine: Integer;
++    FLastParsedTokenRootLine: Integer;
++    FTypeDeclarationLine, FTypeDeclarationRootLine: Integer;
++    FTypeDeclarationFile: string;
+ 
+     { Last comment found in input.
+       This only takes into account normal comments, i.e. not back-comments.
+@@ -198,6 +202,12 @@
+     FShowVisibilities: TVisibilities;
+     FAutoBackComments: boolean;
+     FInfoMergeType: TInfoMergeType;
++    FKeepImplementation: Boolean;
++    FTodoUnit: TPasUnit; // Current parsed unit; non-owning.
++    FTodoRoutine: TPasRoutine; // Retained declaration even without graph capture.
++    FBodyRoutine: TPasRoutine;
++    procedure CaptureBodyToken(Token: TToken);
++  private
+ 
+     { These are the items that the next "back-comment"
+       (the comment starting with "<", see
+@@ -519,7 +529,7 @@
+       appended to Item.FullDeclaration. Also hint directives
+       (Item.HintDirectives, Item.DeprecatedNote) may be set (to true/non-empty) if appropriate
+       hint directive will occur in source file. }
+-    procedure SkipDeclaration(const Item: TPasItem; IsInRecordCase: boolean);
++    procedure SkipDeclaration(const Item: TPasItem; IsInRecordCase: boolean; const InitialEndLevel: Integer = 0);
+ 
+     procedure SetCommentMarkers(const Value: TStringList);
+ 
+@@ -587,6 +597,7 @@
+     { Whether to read comments from the implementation,
+       and how to merge them with the interface comments. }
+     property InfoMergeType: TInfoMergeType read FInfoMergeType write FInfoMergeType;
++    property KeepImplementation: Boolean read FKeepImplementation write FKeepImplementation;
+   end;
+ 
+ implementation
+@@ -667,6 +678,7 @@
+ 
+   Scanner := TScanner.Create(InputStream, OnMessageEvent,
+     VerbosityLevel, AStreamName, AStreamAbsoluteFileName, AHandleMacros);
++  Scanner.OnConsumedToken := CaptureBodyToken;
+   AddDirectives(Directives);
+   Scanner.IncludeFilePaths := IncludeFilePaths;
+   FCommentMarkers := TStringlist.Create;
+@@ -720,7 +732,7 @@
+ 
+ procedure TParser.ExpandHelpInsightDescriptions(var DescriptionInfo: TRawDescriptionInfo);
+ begin
+-  DescriptionInfo.Content := ConvertHelpInsightDescription(DescriptionInfo.Content);
++  { Keep XML intact; the Doxygen backend converts it. }
+ end;
+ 
+ procedure TParser.RemoveRegionDeclarations(var DescriptionInfo: TRawDescriptionInfo);
+@@ -779,6 +791,19 @@
+ 
+ { ---------------------------------------------------------------------------- }
+ 
++procedure TParser.CaptureBodyToken(Token: TToken);
++begin
++  if (FBodyRoutine=nil) or (Token=nil) or Token.BodyRecorded or
++    (Token.MyType in [TOK_WHITESPACE,TOK_COMMENT_PAS,TOK_COMMENT_EXT,
++      TOK_COMMENT_HELPINSIGHT,TOK_COMMENT_CSTYLE,TOK_DIRECTIVE]) then Exit;
++  Token.BodyRecorded:=True;
++  if FBodyRoutine.BodyLine=0 then FBodyRoutine.BodyLine:=Token.Line;
++  case Token.MyType of
++    TOK_STRING, TOK_DOUBLE_QUOTED_STRING: FBodyRoutine.BodyTokens.Add('''literal''');
++    TOK_NUMBER: FBodyRoutine.BodyTokens.Add('0');
++  else FBodyRoutine.BodyTokens.Add(Token.Data); end;
++end;
++
+ function TParser.GetNextToken(out WhitespaceCollector: string): TToken;
+ begin
+   Result := PeekNextToken(WhitespaceCollector);
+@@ -819,6 +844,7 @@
+     Result := T.Data;
+     FLastParsedTokenStreamAbsoluteFileName := T.StreamAbsoluteFileName;
+     FLastParsedTokenLine := T.Line;
++    FLastParsedTokenRootLine := T.RootLine;
+   finally
+     T.Free;
+   end;
+@@ -869,6 +895,7 @@
+     Result := T.Data;
+     FLastParsedTokenStreamAbsoluteFileName := T.StreamAbsoluteFileName;
+     FLastParsedTokenLine := T.Line;
++    FLastParsedTokenRootLine := T.RootLine;
+   finally
+     T.Free;
+   end;
+@@ -884,6 +911,7 @@
+     Result := T.Data;
+     FLastParsedTokenStreamAbsoluteFileName := T.StreamAbsoluteFileName;
+     FLastParsedTokenLine := T.Line;
++    FLastParsedTokenRootLine := T.RootLine;
+   finally
+     T.Free;
+   end;
+@@ -1086,6 +1114,7 @@
+ 
+       M.SourceAbsoluteFileName := t.StreamAbsoluteFileName;
+       M.SourceLine := t.Line;
++      M.SourceRootLine := t.RootLine;
+ 
+       { Consume all following period-delimited identifiers as a single name.
+         Actual only when reading impl section. Resulting name requires additional
+@@ -1401,6 +1430,7 @@
+     Constant.Name := GetAndCheckNextToken(TOK_IDENTIFIER);
+     Constant.SourceAbsoluteFileName := FLastParsedTokenStreamAbsoluteFileName;
+     Constant.SourceLine := FLastParsedTokenLine;
++    Constant.SourceRootLine := FLastParsedTokenRootLine;
+     DoMessage(5, pmtInformation, 'Parsing constant %s', [Constant.Name]);
+     Constant.RawDescriptionInfo^ := GetLastComment;
+     Constant.FullDeclaration := Constant.Name;
+@@ -1428,6 +1458,9 @@
+       end;
+     end;
+ 
++    Scanner.DeclareIdentifier(Constant.Name);
++    if Pos('=',Constant.FullDeclaration)>0 then
++      Scanner.DeclareIdentifier(Constant.Name,Trim(Copy(Constant.FullDeclaration,Pos('=',Constant.FullDeclaration)+1,Length(Constant.FullDeclaration)-Pos('=',Constant.FullDeclaration)-1)));
+     ItemsForNextBackComment.ClearAndAdd(Constant);
+   except
+     FreeAndNil(Constant);
+@@ -1448,6 +1481,7 @@
+   p := TPasEnum.Create;
+   try
+     p.Name := Name;
++    p.Scoped := Scanner.OptionIs('SCOPEDENUMS','ON');
+     p.RawDescriptionInfo^ := RawDescriptionInfo;
+     p.FullDeclaration := Name + ' = (...)';
+     p.SetAttributes(CurrentAttributes);
+@@ -1461,6 +1495,7 @@
+       Item.Name := T.Data;
+       Item.SourceAbsoluteFileName := T.StreamAbsoluteFileName;
+       Item.SourceLine := T.Line;
++      Item.SourceRootLine := T.RootLine;
+       Item.RawDescriptionInfo^ := GetLastComment;
+       Item.FullDeclaration := Item.Name;
+       p.Members.Add(Item);
+@@ -1499,6 +1534,7 @@
+         T := GetNextToken;
+       end;
+     end;
++    P.SourceEndLine := T.Line;
+     FreeAndNil(T);
+ 
+     { Read semicolon, as an optional token.
+@@ -1963,20 +1999,23 @@
+         of overload feature. Specifying Index allows to search for a concrete item.
+         Of course this will work correctly only if methods were declared in the
+         same order as they appear in impl section }
+-  function FindExistingRoutine(U: TPasUnit; const MethodName: string; Index: Integer): TPasRoutine;
++  function FindExistingRoutine(U: TPasUnit; const MethodName: string; Index: Integer; Prototype: TPasRoutine): TPasRoutine;
+   var
+     NameParts: TNameParts;
+     i: Integer;
+     item: TBaseItem;
++    Routines: TPasItems;
++    ShortName: string;
++    OnlyCandidate: TPasRoutine;
++    Candidates: Integer;
+   begin
+     Result := nil;
++    Routines:=nil; ShortName:=MethodName;
+     // Check if we got a standalone routine or a class/record method
+     // NB: method could be FPC operator with symbolic name so just check for dot inside
+     if Pos('.', MethodName) = 0 then
+     begin
+-      item := U.FuncsProcs.FindListItem(MethodName, Index);
+-      if item <> nil then
+-        Result := item as TPasRoutine;
++      Routines:=U.FuncsProcs;
+     end
+     else
+     begin
+@@ -1992,8 +2031,25 @@
+           if item = nil then
+             Break;
+         end;
+-      if item <> nil then
+-        Result := (item as TPasCio).Methods.FindListItem(NameParts[High(NameParts)], Index);
++      if item <> nil then Routines:=(item as TPasCio).Methods;
++      ShortName:=NameParts[High(NameParts)];
++    end;
++    // Implementation order can differ from interface overload order. A forward
++    // declaration and its definition are one routine, not two overloads.
++    if Routines<>nil then
++      for item in Routines do
++        if SameText(item.Name,ShortName) and
++          SameText(TPasRoutine(item).ParamTypes.Text,Prototype.ParamTypes.Text) then
++        begin Result:=TPasRoutine(item); Break; end;
++    // Imported type aliases can spell the same parameter differently, e.g.
++    // Cardinal in the interface and Windows.COLORREF in the implementation.
++    // A unique same-name declaration is the only possible owner in valid Delphi.
++    if (Result=nil) and (Routines<>nil) then
++    begin
++      Candidates:=0; OnlyCandidate:=nil;
++      for item in Routines do if SameText(item.Name,ShortName) then
++      begin Inc(Candidates); OnlyCandidate:=TPasRoutine(item); end;
++      if (Candidates=1) and (OnlyCandidate.ParamTypes.Count=Prototype.ParamTypes.Count) then Result:=OnlyCandidate;
+     end;
+     // print message for debug purposes
+     if Result = nil then
+@@ -2027,18 +2083,26 @@
+     end else
+       Count := 1;
+ 
+-    ExistingRoutine := FindExistingRoutine(U, M.Name, Count - 1);
++    ExistingRoutine := FindExistingRoutine(U, M.Name, Count - 1,M);
++    if FKeepImplementation and (ExistingRoutine=nil) and (Pos('.',M.Name)=0) then
++    begin
++      ExistingRoutine:=M; U.FuncsProcs.Add(M);
++      ExistingRoutine.MyUnit:=U; ExistingRoutine.Visibility:=viPrivate;
++    end;
+     // NB: Currently we don't add methods not declared in intf section
+     if ExistingRoutine <> nil then
+       MergeRoutineData(FInfoMergeType, ExistingRoutine, M.RawDescriptionInfo^);
+     // External and forward methods have no body
+     if [SD_FORWARD, SD_EXTERNAL]*M.Directives = [] then
+     begin
+-      SkipMethodBody;
++      if FKeepImplementation then FBodyRoutine:=ExistingRoutine;
++      FTodoRoutine:=ExistingRoutine;
++      try SkipMethodBody;
++      finally FBodyRoutine:=nil; FTodoRoutine:=nil; end;
+       DoMessage(5, pmtInformation, 'Skipped body of %s "%s"',
+         [RoutineTypeToString(RoutineType), M.Name]);
+     end;
+-    FreeAndNil(M);
++    if M<>ExistingRoutine then FreeAndNil(M);
+   end;
+ 
+ var
+@@ -2096,7 +2160,8 @@
+                 KEY_THREADVAR, KEY_VAR:
+                   begin
+                     Scanner.UnGetToken(t);
+-                    ParseTVCSection(DummyUnit); // parse section but don't add to resulting unit
++                    if FKeepImplementation then ParseTVCSection(U)
++                    else ParseTVCSection(DummyUnit);
+                   end;
+                 KEY_CLASS, KEY_OBJCCLASS:
+                   //ClassKeyWordString := t.Data; // not needed after all
+@@ -2107,7 +2172,7 @@
+                   end;
+                 // Do not read unit used internally for now - maybe will do in the future
+                 KEY_USES:
+-                  ParseUses(nil);
++                  if FKeepImplementation then ParseUses(U) else ParseUses(nil);
+                 KEY_PROPERTY:
+                   begin
+                     ParseProperty(PropertyParsed);
+@@ -2248,6 +2313,7 @@
+     p.Name := GetAndCheckNextToken(TOK_IDENTIFIER);
+     p.SourceAbsoluteFileName := FLastParsedTokenStreamAbsoluteFileName;
+     p.SourceLine := FLastParsedTokenLine;
++    p.SourceRootLine := FLastParsedTokenRootLine;
+     DoMessage(5, pmtInformation, 'Parsing property %s', [p.Name]);
+     p.IndexDecl := '';
+     p.Proptype := '';
+@@ -2360,6 +2426,7 @@
+       p.Name := t.Data;
+       p.SourceAbsoluteFileName := t.StreamAbsoluteFileName;
+       p.SourceLine := t.Line;
++      p.SourceRootLine := t.RootLine;
+       p.RawDescriptionInfo^ := GetLastComment;
+       p.FullDeclaration := p.Name + ': ' + GetAndCheckNextToken(TOK_IDENTIFIER);
+       p.SetAttributes(CurrentAttributes);
+@@ -2486,7 +2553,7 @@
+       L: Integer;
+     begin
+       L := Length(S);
+-      while (L > 0) and (S[L] in CharSet) do
++      while (L > 0) and CharInSet(S[L], CharSet) do
+         Dec(L);
+       Result := Copy(S, 1, L);
+     end;
+@@ -2512,6 +2579,10 @@
+         // copy properties
+         Name := P.Name;
+         FullDeclaration:= P.FullDeclaration;
++        SourceLine := P.SourceLine;
++        SourceRootLine := P.SourceRootLine;
++        SourceAbsoluteFileName := P.SourceAbsoluteFileName;
++        RawDescriptionInfo^ := P.RawDescriptionInfo^;
+         DeprecatedNote:= P.DeprecatedNote;
+         HintDirectives:= P.HintDirectives;
+ 
+@@ -2533,6 +2604,8 @@
+   AliasType: TPasAliasType;
+   T, T2: TToken;
+   IsGeneric: boolean;
++  TypeDeclarationLine, TypeDeclarationRootLine: Integer;
++  TypeDeclarationFile: string;
+   CioType: TCIOType;
+ begin
+   { Read the type name, preceded by optional "generic" directive.
+@@ -2554,11 +2627,19 @@
+       TypeName := T.Data;
+     end;
+     TypeNameWithGeneric := TypeNameWithGeneric + TypeName;
++    Scanner.DeclareIdentifier(TypeName);
+ 
+     FLastParsedTokenStreamAbsoluteFileName := T.StreamAbsoluteFileName;
+     FLastParsedTokenLine := T.Line;
++    FLastParsedTokenRootLine := T.RootLine;
+   finally FreeAndNil(T) end;
+ 
++  TypeDeclarationLine:=FLastParsedTokenLine;
++  TypeDeclarationRootLine:=FLastParsedTokenRootLine;
++  TypeDeclarationFile:=FLastParsedTokenStreamAbsoluteFileName;
++  FTypeDeclarationLine:=TypeDeclarationLine;
++  FTypeDeclarationRootLine:=TypeDeclarationRootLine;
++  FTypeDeclarationFile:=TypeDeclarationFile;
+   DoMessage(5, pmtInformation, 'Parsing type "%s"', [TypeName]);
+ 
+   RawDescriptionInfo := GetLastComment;
+@@ -2661,6 +2742,9 @@
+           ParseRoutine(RoutineType, '', t.Data, KeyWordToRoutineType(t.Info.KeyWord),
+             RawDescriptionInfo, false, true, '');
+           RoutineType.Name := TypeName;
++          RoutineType.SourceLine := TypeDeclarationLine;
++          RoutineType.SourceRootLine := TypeDeclarationRootLine;
++          RoutineType.SourceAbsoluteFileName := TypeDeclarationFile;
+           RoutineType.FullDeclaration :=
+             TypeName + ' = ' + RoutineType.FullDeclaration;
+           RoutineType.IsType := true;
+@@ -2675,7 +2759,8 @@
+       begin
+         ParseEnum(EnumType, TypeName, RawDescriptionInfo);
+         EnumType.SourceAbsoluteFileName := FLastParsedTokenStreamAbsoluteFileName;
+-        EnumType.SourceLine := FLastParsedTokenLine;
++        EnumType.SourceLine := TypeDeclarationLine;
++        EnumType.SourceRootLine := TypeDeclarationRootLine;
+         DoAddType(TPasItem(EnumType));
+         FreeAndNil(t);
+         if CioState <> nil then
+@@ -2696,6 +2781,7 @@
+     TryPromoteToWeakTypeAlias(NormalType);
+     NormalType.SourceAbsoluteFileName := FLastParsedTokenStreamAbsoluteFileName;
+     NormalType.SourceLine := FLastParsedTokenLine;
++    NormalType.SourceRootLine := FLastParsedTokenRootLine;
+     NormalType.RawDescriptionInfo^ := RawDescriptionInfo;
+     NormalType.SetAttributes(CurrentAttributes);
+     ItemsForNextBackComment.ClearAndAdd(NormalType);
+@@ -2720,6 +2806,7 @@
+   U.Name := ParseQualifiedIdentifier;
+   U.SourceAbsoluteFileName := FLastParsedTokenStreamAbsoluteFileName;
+   U.SourceLine := FLastParsedTokenLine;
++    U.SourceRootLine := FLastParsedTokenRootLine;
+ 
+   ItemsForNextBackComment.ClearAndAdd(U);
+ 
+@@ -2752,6 +2839,7 @@
+   U.Name := GetAndCheckNextToken(TOK_IDENTIFIER);
+   U.SourceAbsoluteFileName := FLastParsedTokenStreamAbsoluteFileName;
+   U.SourceLine := FLastParsedTokenLine;
++    U.SourceRootLine := FLastParsedTokenRootLine;
+ 
+   ItemsForNextBackComment.ClearAndAdd(U);
+ 
+@@ -2805,8 +2893,10 @@
+ procedure TParser.ParseUnitOrProgram(var U: TPasUnit);
+ var
+   t: TToken;
++  PreviousExitCode: Integer;
+ begin
+   U := TPasUnit.Create;
++  FTodoUnit := U;
+   try
+     t := PeekNextToken;
+     CheckToken(t, TOK_KEYWORD);
+@@ -2829,10 +2919,29 @@
+             [LowerCase(KeyWordArray[KEY_UNIT]), LowerCase(KeyWordArray[KEY_LIBRARY]), LowerCase(KeyWordArray[KEY_PROGRAM])]),
+           T.Description]);
+     end;
++    if FInfoMergeType <> imtNone then
++    begin
++      // Declaration parsing stops at initialization or a program's main body.
++      // Still scan its active comments, including comments after the final dot.
++      // Lexical errors keep their normal failure result; only actual EOF ends it.
++      t := nil;
++      PreviousExitCode := System.ExitCode;
++      try
++        repeat
++          t := GetNextToken;
++          FreeAndNil(t);
++        until False;
++      except
++        // EPasDoc exceptions set System.ExitCode even when they are handled.
++        on E: ETokenizerStreamEnd do System.ExitCode := PreviousExitCode;
++      end;
++    end;
+   except
++    FTodoUnit := nil;
+     FreeAndNil(U);
+     raise;
+   end;
++  FTodoUnit := nil;
+ end;
+ 
+ { ---------------------------------------------------------------------------- }
+@@ -3009,7 +3118,7 @@
+   I: Integer;
+   RawDescriptions: TRawDescriptionInfoList;
+   SavedStreamAbsoluteFileName: string;
+-  SavedLine: Integer;
++  SavedLine, SavedRootLine: Integer;
+   NewItems: TPasItems;
+ begin
+   NewItemNames := nil;
+@@ -3027,6 +3136,7 @@
+     ParseCommaSeparatedIdentifiers(NewItemNames, SYM_COLON, RawDescriptions);
+     SavedStreamAbsoluteFileName := FLastParsedTokenStreamAbsoluteFileName;
+     SavedLine := FLastParsedTokenLine;
++    SavedRootLine := FLastParsedTokenRootLine;
+ 
+     ItemCollector := TPasFieldVariable.Create;
+     try
+@@ -3079,7 +3189,7 @@
+       end else
+       if t.IsKeyWord(KEY_RECORD) then
+       begin
+-        ParseCIO(nil, '', '', CIO_RECORD, EmptyRawDescriptionInfo, IsInRecordCase);
++        SkipDeclaration(ItemCollector,IsInRecordCase,1);
+       end else
+       if t.IsKeyWord(KEY_PACKED) then
+       begin
+@@ -3087,7 +3197,8 @@
+         t := GetNextToken;
+         if t.IsKeyWord(KEY_RECORD) then
+         begin
+-          ParseCIO(nil, '', '', CIO_PACKEDRECORD, EmptyRawDescriptionInfo, IsInRecordCase);
++          ItemCollector.FullDeclaration:=ItemCollector.FullDeclaration+' record';
++          SkipDeclaration(ItemCollector,IsInRecordCase,1);
+         end else
+         begin
+           SkipDeclaration(ItemCollector, IsInRecordCase);
+@@ -3128,6 +3239,7 @@
+         NewItem.Name := NewItemNames[I];
+         NewItem.SourceAbsoluteFileName := SavedStreamAbsoluteFileName;
+         NewItem.SourceLine := SavedLine;
++        NewItem.SourceRootLine := SavedRootLine;
+         NewItem.RawDescriptionInfo^ := RawDescriptions[I];
+         NewItem.Visibility := Visibility;
+         NewItem.SetAttributes(CurrentAttributes);
+@@ -3178,7 +3290,7 @@
+   FIgnoreMarkers.Assign(Value);
+ end;
+ 
+-procedure TParser.SkipDeclaration(const Item: TPasItem; IsInRecordCase: boolean);
++procedure TParser.SkipDeclaration(const Item: TPasItem; IsInRecordCase: boolean; const InitialEndLevel: Integer);
+ var
+   EndLevel: Integer;
+   IsSemicolon: Boolean;
+@@ -3186,7 +3298,7 @@
+   t: TToken;
+   WhitespaceCollectorToAdd: string;
+ begin
+-  EndLevel := 0;
++  EndLevel := InitialEndLevel;
+   PLevel := 0;
+   repeat
+     WhitespaceCollectorToAdd := '';
+@@ -3318,7 +3430,7 @@
+     BackCommentMarker = '<';
+   var
+     i: integer;
+-    Marker: string;
++    Marker, BackText: string;
+     WasMarker: boolean;
+     CurPos: integer;
+   begin
+@@ -3360,9 +3472,13 @@
+       end;
+     end;
+ 
+-    if (not (T.MyType = TOK_COMMENT_HELPINSIGHT)) and SCharIs(CommentInfo.Content, 1, BackCommentMarker) then
++    BackText:=CommentInfo.Content;
++    if (FBodyRoutine=nil) and SCharIs(BackText,1,BackCommentMarker) and
++      not SCharIs(BackText,2,['-','=']) and not
++      ((Length(BackText)>1) and (BackText[2]<>' ') and (Pos('>',BackText)>0)) then
+     begin
+       BackComment := true;
++      CommentInfo.Content:=BackText;
+       Delete(CommentInfo.Content, 1, Length(BackCommentMarker));
+     end;
+ 
+@@ -3389,6 +3505,8 @@
+   innerBrackets: Integer;
+   parenthesis: Integer;
+   firstToken, WasLineFeed: Boolean;
++  TodoText: string;
++  SourceTodo: TPasSourceTodo;
+ begin
+   Result := nil;
+   WhitespaceCollector := ''; WasLineFeed := False;
+@@ -3474,6 +3592,23 @@
+ 
+         { Get info from T }
+         ExtractDocComment(T, TCommentInfo, TBackComment);
++        TodoText := Trim(TCommentInfo.Content);
++        if (FTodoUnit <> nil) and (Length(TodoText) >= 4) and
++          SameText(Copy(TodoText, 1, 4), 'TODO') and
++          ((Length(TodoText) = 4) or (TodoText[5] = ':') or
++           CharInSet(TodoText[5], [#9, #10, #13, ' '])) then
++        begin
++          SourceTodo := TPasSourceTodo.Create;
++          SourceTodo.Text := TodoText;
++          SourceTodo.SourceFile := T.StreamAbsoluteFileName;
++          SourceTodo.Line := T.Line;
++          SourceTodo.Owner := FTodoRoutine;
++          FTodoUnit.SourceTodos.Add(SourceTodo);
++          // Store once, independently of the ordinary documentation comment.
++          // The scanner has already excluded inactive conditional branches.
++          FreeAndNil(T);
++          Continue;
++        end;
+         TIsCStyle := (t.MyType in [TOK_COMMENT_CSTYLE, TOK_COMMENT_HELPINSIGHT]);
+         THelpInsight := t.MyType = TOK_COMMENT_HELPINSIGHT;
+ 
+@@ -3503,13 +3638,9 @@
+           for i := 0 to ItemsForNextBackComment.Count - 1 do
+           begin
+             // use Trim(), see @url(https://sourceforge.net/p/pasdoc/bugs/89/ pasdoc bug 89)
+-            if Trim(ItemsForNextBackComment.PasItemAt[i].RawDescription) <> '' then
+-              DoMessage(1, pmtWarning,
+-                '%s: Item %s already has one description, now it''s ' +
+-                'overridden by back-comment (comment starting with "<"): "%s"',
+-                [ Scanner.GetStreamInfo,
+-                  ItemsForNextBackComment.PasItemAt[i].QualifiedName,
+-                  TCommentInfo.Content]);
++            if (Trim(ItemsForNextBackComment.PasItemAt[i].RawDescription)<>'') and
++              (Trim(ItemsForNextBackComment.PasItemAt[i].RawDescription)<>Trim(TCommentInfo.Content)) then
++              TCommentInfo.Content:=ItemsForNextBackComment.PasItemAt[i].RawDescription+LineEnding+TCommentInfo.Content;
+ 
+             ItemsForNextBackComment.PasItemAt[i].RawDescriptionInfo^ := TCommentInfo;
+           end;
+@@ -3745,6 +3876,7 @@
+             end;
+           KEY_END:
+             begin
++              ACio.SourceEndLine := t.Line;
+               Result := TRUE;
+               FreeAndNil(t);
+               Break;
+@@ -4017,8 +4149,9 @@
+     try
+       ACio.Name := CioName;
+       ACio.NameWithGeneric := CioNameWithGeneric;
+-      ACio.SourceAbsoluteFileName := FLastParsedTokenStreamAbsoluteFileName;
+-      ACio.SourceLine := FLastParsedTokenLine;
++      ACio.SourceAbsoluteFileName := FTypeDeclarationFile;
++      ACio.SourceLine := FTypeDeclarationLine;
++      ACio.SourceRootLine := FTypeDeclarationRootLine;
+       ACio.RawDescriptionInfo^ := RawDescriptionInfo;
+       ACio.MyType := CIOType;
+ 
+@@ -4134,7 +4267,7 @@
+                 TMyClass1 = class(TMyClass2);
+                 TMyClass2 = class(TMyClass1);
+             }
+-            if AncestorName = ACio.Name then
++            if AncestorFullDeclaration = ACio.NameWithGeneric then
+               DoMessage(1, pmtWarning,
+                 'Class or interface refers to itself as ancestor, ignoring to avoid infinite loops when traversing hierarchy: %s', [
+                 ACio.Name
+@@ -4190,6 +4323,14 @@
+       begin
+         GetAndCheckNextToken(KEY_FOR);
+         ACio.HelperTypeIdentifier := ParseKnownTypeIdentifier;
++        if PeekNextToken.IsSymbol(SYM_LESS_THAN) then
++        begin
++          FreeAndNil(t);
++          t:=GetNextToken;
++          AncestorFullDeclaration:=ACio.HelperTypeIdentifier;
++          ParseGenericTypeIdentifierList(t,AncestorFullDeclaration);
++          ACio.HelperTypeIdentifier:=AncestorFullDeclaration;
++        end;
+       end;
+ 
+       if ACio.MyType in [ CIO_CLASS, CIO_PACKEDCLASS, CIO_OBJCCLASS, CIO_PACKEDOBJCCLASS ] then
+@@ -4287,7 +4428,8 @@
+   Assert(Assigned(LCio));
+ 
+   while ParseCioMembers(LCio, LSection, IsInRecordCase, LVisibility) do
+-  begin // A Cio completed, nested or outer CIO
++  begin
++ // A Cio completed, nested or outer CIO
+     { Clear any orphan comments - do not let them break away from the CIO }
+     IsLastComment := false;
+     ItemsForNextBackComment.ClearAndAdd(LCio);
+--- a/PasDoc_Scanner.pas
++++ b/PasDoc_Scanner.pas
+@@ -1,3 +1,4 @@
++{ Pas2Dox modification 2026-11-10. See ORIGIN.md. }
+ {
+   Copyright 1998-2026 PasDoc developers.
+ 
+@@ -79,13 +80,18 @@
+ 
+     Single TScanner instance scans one unit using one or more @link(TTokenizer)
+     instances (to scan the unit and all nested include files). }
++  TConsumedTokenEvent = procedure(Token: TToken) of object;
+   TScanner = class(TObject)
+   private
+     FCurrentTokenizer: Integer;
++    FRootLines: array[0..MAX_TOKENIZERS-1] of Integer;
++    FNextRootLine: Integer;
++    FEvaluationDepth: Integer;
+     FDirectiveLevel: Integer;
+     FTokenizers: array[0..MAX_TOKENIZERS - 1] of TTokenizer;
+     FSwitchOptions: TSwitchOptions;
+     FBufferedTokens: TTokenList;
++    FOnConsumedToken: TConsumedTokenEvent;
+ 
+     { For each symbol:
+         Name is the unique Name,
+@@ -97,6 +103,10 @@
+       if symbol is a macro. A non-macro symbol is something
+       different than a macro that expands to nothing. }
+     FSymbols: TStringPairVector;
++    FDeclarations: TStringList;
++    FConstants: TStringPairVector;
++    FLongOptions: TStringList;
++    FOptionStack: TObjectList;
+ 
+     FIncludeFilePaths: TStringVector;
+     FOnMessage: TPasDocMessageEvent;
+@@ -152,6 +162,7 @@
+ 
+     { Calculate boolean condition, like the one allowed at $if and $elseif. }
+     function IfCondition(const Condition: String): Boolean;
++    function EvaluateExpression(const Condition: String): Variant;
+   protected
+     procedure DoError(const AMessage: string;
+       const AArguments: array of const);
+@@ -181,6 +192,8 @@
+ 
+     { Adds Name as a symbol that is a macro, that expands to Value. }
+     procedure AddMacro(const Name, Value: string);
++    function OptionIs(const Name, Value: string): Boolean;
++    procedure DeclareIdentifier(const Name: string; const Value: string = '');
+ 
+     { Gets next token and throws it away. }
+     procedure ConsumeToken;
+@@ -213,6 +226,7 @@
+     procedure UnGetToken(var t: TToken);
+ 
+     property OnMessage: TPasDocMessageEvent read FOnMessage write FOnMessage;
++    property OnConsumedToken: TConsumedTokenEvent read FOnConsumedToken write FOnConsumedToken;
+     property Verbosity: Cardinal read FVerbosity write FVerbosity;
+     property SwitchOptions: TSwitchOptions read FSwitchOptions;
+ 
+@@ -379,6 +393,14 @@
+   FSwitchOptions['X'] := True;
+ 
+   FSymbols := TStringPairVector.Create(true);
++  FDeclarations := TStringList.Create;
++  FConstants := TStringPairVector.Create(True);
++  FLongOptions:=TStringList.Create;
++  FLongOptions.Values['SCOPEDENUMS']:='OFF';
++  FLongOptions.Values['INLINE']:='ON';
++  FLongOptions.Values['TEXTBLOCK']:='NATIVE';
++  FOptionStack:=TObjectList.Create(True);
++  FDeclarations.CaseSensitive := False;
+ 
+   FTokenizers[0] := TTokenizer.Create(s, OnMessageEvent, VerbosityLevel,
+     AStreamName, AStreamAbsoluteFileName);
+@@ -395,6 +417,10 @@
+   i: Integer;
+ begin
+   FSymbols.Free;
++  FDeclarations.Free;
++  FConstants.Free;
++  FLongOptions.Free;
++  FOptionStack.Free;
+ 
+   for i := 0 to FCurrentTokenizer do begin
+     FTokenizers[i].Free;
+@@ -433,7 +459,12 @@
+ begin
+   if NewSymbols <> nil then
+     for i := 0 to NewSymbols.Count - 1 do
+-      AddSymbol(NewSymbols[i])
++    begin
++      if Pos('=', NewSymbols[i]) > 0 then
++        AddMacro(Copy(NewSymbols[i], 1, Pos('=', NewSymbols[i])-1),
++          Copy(NewSymbols[i], Pos('=', NewSymbols[i])+1, MaxInt))
++      else AddSymbol(NewSymbols[i]);
++    end
+ end;
+ 
+ { ---------------------------------------------------------------------------- }
+@@ -442,6 +473,8 @@
+ var
+   i: Integer;
+ begin
++  if SameText(Copy(Name,1,Length('PAS2DOX_OPTION_')),'PAS2DOX_OPTION_') then
++    FLongOptions.Values[UpperCase(Copy(Name,Length('PAS2DOX_OPTION_')+1,MaxInt))]:=UpperCase(Value);
+   i := FSymbols.FindName(Name);
+   if i = -1 then
+   begin
+@@ -457,6 +490,15 @@
+ 
+ { ---------------------------------------------------------------------------- }
+ 
++function TScanner.OptionIs(const Name, Value: string): Boolean;
++begin Result:=IsSwitchDefined(Name+' '+Value); end;
++
++procedure TScanner.DeclareIdentifier(const Name, Value: string);
++begin
++  if FDeclarations.IndexOf(Name)<0 then FDeclarations.Add(Name);
++  if (Value<>'') and (FConstants.FindName(Name)<0) then FConstants.Add(TStringPair.Create(Name,Value,nil));
++end;
++
+ procedure TScanner.ConsumeToken;
+ var
+   LastToken: TToken;
+@@ -464,6 +506,7 @@
+   if FBufferedTokens.Count > 0 then
+   Begin
+     LastToken := FBufferedTokens.Last;
++    if Assigned(FOnConsumedToken) then FOnConsumedToken(LastToken);
+     FBufferedTokens.Extract(LastToken);
+   end;
+ end;
+@@ -522,7 +565,7 @@
+   var
+     SymbolIndex: Integer;
+   begin
+-    Result := T.MyType = TOK_IDENTIFIER;
++    Result := HandleMacros and (T.MyType = TOK_IDENTIFIER);
+     if Result then
+     begin
+       SymbolIndex := FSymbols.FindName(T.Data);
+@@ -636,6 +679,8 @@
+     begin
+       { get next token from tokenizer }
+       Result := FTokenizers[FCurrentTokenizer].GetToken;
++      if FCurrentTokenizer=0 then Result.RootLine:=Result.Line
++      else Result.RootLine:=FRootLines[FCurrentTokenizer];
+       try
+         { if token is a directive, then we handle it }
+         if Result.MyType = TOK_DIRECTIVE then
+@@ -696,7 +741,7 @@
+                 'IFDEF', DirectiveParamBlack);
+               DT_IFNDEF: HandleIfDirective(not IsSymbolDefined(DirectiveParamBlack),
+                 'IFNDEF', DirectiveParamBlack);
+-              DT_IFOPT: HandleIfDirective(IsSwitchDefined(DirectiveParamBlack),
++              DT_IFOPT: HandleIfDirective(IsSwitchDefined(DirectiveParamWhite),
+                 'IFOPT', DirectiveParamBlack);
+               DT_IF: HandleIfDirective(IfCondition(DirectiveParamWhite),
+                 'IF', DirectiveParamWhite);
+@@ -723,6 +768,7 @@
+                     Break;
+                   end else
+                   begin
++                    FNextRootLine:=Result.RootLine;
+                     OpenIncludeFile(DirectiveParamBlack);
+                   end;
+                 end;
+@@ -774,23 +820,69 @@
+ 
+ { ---------------------------------------------------------------------------- }
+ 
++function SwitchLongName(const Letter: Char): string;
++begin
++  case Letter of
++    'A': Result:='ALIGN'; 'B': Result:='BOOLEVAL'; 'C': Result:='ASSERTIONS';
++    'D': Result:='DEBUGINFO'; 'E': Result:='OLDOBJWARN'; 'G': Result:='IMPORTEDDATA';
++    'H': Result:='LONGSTRINGS'; 'I': Result:='IOCHECKS'; 'J': Result:='WRITEABLECONST';
++    'L': Result:='LOCALSYMBOLS'; 'M': Result:='TYPEINFO'; 'O': Result:='OPTIMIZATION';
++    'P': Result:='OPENSTRINGS'; 'Q': Result:='OVERFLOWCHECKS'; 'R': Result:='RANGECHECKS';
++    'S': Result:='STACKCHECKS'; 'T': Result:='TYPEDADDRESS'; 'U': Result:='SAFEDIVIDE';
++    'V': Result:='VARSTRINGCHECKS'; 'W': Result:='STACKFRAMES'; 'X': Result:='EXTENDEDSYNTAX';
++    'Y': Result:='REFERENCEINFO'; 'Z': Result:='MINENUMSIZE';
++  else Result:=''; end;
++end;
++
+ function TScanner.IsSwitchDefined(N: string): Boolean;
+-begin
+-  { We expect a length 2 AnsiString like 'I+' or 'A-', first character a letter,
+-    second character plus or minus }
+-  if Length(N) >= 2 then
+-    begin;
+-      if (N[1] >= 'a') and (N[1] <= 'z') then
+-        N[1] := Char(Ord(N[1]) - 32);
+-      if (N[1] >= 'A') and (N[1] <= 'Z') and ((N[2] = '-') or (N[2] = '+')) then
+-        begin
+-          Result := FSwitchOptions[N[1]] = (N[2] = '+');
+-          Exit;
+-        end;
++var P, Index, OperatorPosition: Integer; Key, Expected, Actual, Comparison: string; Letter: Char;
++begin
++  N:=UpperCase(Trim(N));
++  if (Length(N)=2) and CharInSet(N[1],['A'..'Z']) and CharInSet(N[2],['+','-']) then
++  begin
++    Key:=SwitchLongName(N[1]); Actual:=FLongOptions.Values[Key];
++    if Actual='' then
++    begin
++      Index:=FSymbols.FindName('PAS2DOX_OPTION_'+Key);
++      if Index>=0 then Actual:=FSymbols[Index].Value;
+     end;
+-
+-  DoMessage(2, pmtInformation, GetStreamInfo + ': Invalid $IFOPT parameter (%s).', [N]);
+-  Result := False;
++    if Actual<>'' then Exit((not SameText(Actual,'OFF') and (Actual<>'0'))=(N[2]='+'));
++    Exit(FSwitchOptions[N[1]]=(N[2]='+'));
++  end;
++  Comparison:=''; OperatorPosition:=0;
++  for P:=1 to Length(N) do if CharInSet(N[P],['<','>','=']) then begin OperatorPosition:=P; Break; end;
++  if OperatorPosition>0 then
++  begin
++    P:=OperatorPosition;
++    Comparison:=N[P];
++    if (P<Length(N)) and CharInSet(N[P+1],['<','>','=']) then Comparison:=Comparison+N[P+1];
++    N:=Copy(N,1,P-1)+' '+Copy(N,P+Length(Comparison),MaxInt);
++  end;
++  P:=Pos(' ',N);
++  if P=0 then DoError('Long IFOPT requires an option name and value',[]);
++  Key:=Copy(N,1,P-1); Expected:=Trim(Copy(N,P+1,MaxInt));
++  if Key='SETOSVERSION' then Key:='SETPEOSVERSION';
++  if Key='SETSUBVERSION' then Key:='SETPESUBSYSVERSION';
++  if Key='SETUSERVERSION' then Key:='SETPEUSERVERSION';
++  if (Key='WARN') and (Pos(' ',Expected)>0) then
++  begin
++    P:=Pos(' ',Expected); Key:=Key+' '+Copy(Expected,1,P-1); Expected:=Trim(Copy(Expected,P+1,MaxInt));
++  end;
++  Actual:=FLongOptions.Values[Key];
++  if (Actual='') and (Copy(Key,1,5)='WARN ') then Actual:=FLongOptions.Values['WARN ALL'];
++  if Actual='' then
++  begin
++    Index:=FSymbols.FindName('PAS2DOX_OPTION_'+Key);
++    if Index>=0 then Actual:=FSymbols[Index].Value;
++  end;
++  if Actual='' then
++    for Letter:='A' to 'Z' do
++      if (SwitchLongName(Letter)=Key) and not CharInSet(Letter,['A','D','Z']) then
++        if FSwitchOptions[Letter] then Actual:='ON' else Actual:='OFF';
++  if Actual='' then DoError('IFOPT needs an explicit setting for %s; use --option=NAME=VALUE',[Key]);
++  if Comparison<>'' then Exit(IfCondition('('+Actual+') '+Comparison+' ('+Expected+')'));
++  if (Key='SETPEFLAGS') or (Key='SETPEOPTFLAGS') then Exit(IfCondition('('+Actual+' and '+Expected+') = '+Expected));
++  Result:=SameText(Actual,Expected);
+ end;
+ 
+ { ---------------------------------------------------------------------------- }
+@@ -815,6 +907,7 @@
+ 
+   { add new tokenizer }
+   Inc(FCurrentTokenizer);
++  FRootLines[FCurrentTokenizer]:=FNextRootLine;
+   FTokenizers[FCurrentTokenizer] := Tokenizer;
+ end;
+ 
+@@ -1022,7 +1115,10 @@
+ var
+   p: PChar;
+   l: Cardinal;
+-  c: Char;
++  c, Letter: Char;
++  Content, OptionName, Black, Value, Eligible, SwitchValue: string;
++  Snapshot: TStringList;
++  Index: Integer;
+ 
+   procedure SkipWhiteSpace;
+   begin
+@@ -1034,6 +1130,44 @@
+   end;
+ 
+ begin
++  if Copy(Comment,1,2)='{$' then Content:=Copy(Comment,2,Length(Comment)-2)
++  else if Copy(Comment,1,3)='(*$' then Content:=Copy(Comment,3,Length(Comment)-4)
++  else Exit;
++  SplitDirective(Content,OptionName,Black,Value);
++  OptionName:=UpperCase(OptionName); Value:=UpperCase(Trim(Value));
++  Eligible:='|ALIGN|BOOLEVAL|ASSERTIONS|DEBUGINFO|OLDOBJWARN|IMPORTEDDATA|LONGSTRINGS|IOCHECKS|WRITEABLECONST|LOCALSYMBOLS|TYPEINFO|OPTIMIZATION|OPENSTRINGS|OVERFLOWCHECKS|RANGECHECKS|STACKCHECKS|TYPEDADDRESS|SAFEDIVIDE|VARSTRINGCHECKS|STACKFRAMES|EXTENDEDSYNTAX|' +
++    'REFERENCEINFO|DEFINITIONINFO|MINENUMSIZE|AUTOBOX|FINITEFLOAT|HINTS|IMPLICITBUILD|REALCOMPATIBILITY|UNSAFECODE|METHODINFO|NATIVE_CPP_INTERFACES|SCOPEDENUMS|POINTERMATH|COMPATIBLELITERALS|HIGHCHARUNICODE|OLDTYPELAYOUT|WEAKLINKRTTI|STRONGLINKTYPES|' +
++    'EXCESSPRECISION|EXTENDEDCOMPATIBILITY|ZEROBASEDSTRINGS|LEGACYIFEND|WARN|CODEALIGN|MAXPAGESIZE|DESIGNONLY|RUNONLY|VARPROPSETTER|DUPLICATEENABLE|RTTI|INLINE|WARNINGS|TEXTBLOCK|';
++  if OptionName='PUSHOPT' then
++  begin
++    if Value<>'' then DoError('PUSHOPT subsets require explicit compiler option configuration',[]);
++    Snapshot:=TStringList.Create;
++    Snapshot.Assign(FLongOptions);
++    for Letter:='A' to 'Z' do Snapshot.Values['__'+Letter]:=IntToStr(Ord(FSwitchOptions[Letter]));
++    FOptionStack.Add(Snapshot); Exit;
++  end;
++  if OptionName='POPOPT' then
++  begin
++    if FOptionStack.Count=0 then DoError('POPOPT has no matching PUSHOPT',[]);
++    Snapshot:=TStringList(FOptionStack.Last);
++    for Letter:='A' to 'Z' do FSwitchOptions[Letter]:=Snapshot.Values['__'+Letter]='1';
++    for Index:=FLongOptions.Count-1 downto 0 do
++      if (Pos('|'+FLongOptions.Names[Index]+'|',Eligible)>0) or (Copy(FLongOptions.Names[Index],1,5)='WARN ') then FLongOptions.Delete(Index);
++    for Index:=0 to Snapshot.Count-1 do
++      if (Pos('|'+Snapshot.Names[Index]+'|',Eligible)>0) or (Copy(Snapshot.Names[Index],1,5)='WARN ') then
++        FLongOptions.Values[Snapshot.Names[Index]]:=Snapshot.ValueFromIndex[Index];
++    FOptionStack.Delete(FOptionStack.Count-1); Exit;
++  end;
++  if (OptionName='WARN') and (Pos(' ',Value)>0) then
++  begin
++    Index:=Pos(' ',Value); OptionName:=OptionName+' '+Copy(Value,1,Index-1); Value:=Trim(Copy(Value,Index+1,MaxInt));
++  end;
++  if (Value<>'') and (OptionName<>'') then FLongOptions.Values[OptionName]:=Value;
++  if (Value='ON') or (Value='OFF') then
++  begin
++    for Letter:='A' to 'Z' do
++      if SwitchLongName(Letter)=OptionName then FSwitchOptions[Letter]:=Value='ON';
++  end;
+   p := Pointer(Comment);
+   l := Length(Comment);
+ 
+@@ -1063,12 +1197,21 @@
+     if CharInSet(c, ['a'..'z']) then
+       Dec(c, 32);
+ 
+-    if not CharInSet(c, ['A'..'Z']) or not CharInSet(p[1], ['-', '+']) then
+-      Exit;
+-
+-    FSwitchOptions[c] := p[1] = '+';
+-    Inc(p, 2);
+-    Dec(l, 2);
++    if not CharInSet(c, ['A'..'Z']) then Exit;
++    Inc(p); Dec(l); SwitchValue:='';
++    if CharInSet(p^,['-','+']) then
++    begin
++      FSwitchOptions[c]:=p^='+';
++      if p^='+' then SwitchValue:='ON' else SwitchValue:='OFF';
++      Inc(p); Dec(l);
++    end else if CharInSet(c,['A','D','Z']) then
++    begin
++      while (l>0) and CharInSet(p^,['0'..'9']) do
++      begin SwitchValue:=SwitchValue+p^; Inc(p); Dec(l); end;
++      if SwitchValue='' then Exit;
++      FSwitchOptions[c]:=SwitchValue<>'0';
++    end else Exit;
++    if SwitchLongName(c)<>'' then FLongOptions.Values[SwitchLongName(c)]:=SwitchValue;
+ 
+     SkipWhiteSpace;
+ 
+@@ -1086,7 +1229,7 @@
+   {$notes off}
+ {$endif}
+ 
+-function TScanner.IfCondition(const Condition: String): Boolean;
++function TScanner.EvaluateExpression(const Condition: String): Variant;
+ var
+   Tokenizer: TTokenizer;
+ 
+@@ -1143,6 +1286,24 @@
+     Result := IsSymbolDefined(SymbolName);
+   end;
+ 
++  function ParseTypeParameter: string;
++  var T: TToken;
++  begin
++    T:=NextToken;
++    try
++      if not T.IsSymbol(SYM_LEFT_PARENTHESIS) then raise EInvalidIfCondition.Create('Expected type argument in parentheses',[]);
++    finally T.Free; end;
++    Result:='';
++    repeat
++      T:=NextToken;
++      if T=nil then raise EInvalidIfCondition.Create('Unclosed type argument',[]);
++      try
++        if T.IsSymbol(SYM_RIGHT_PARENTHESIS) then Break;
++        Result:=Result+T.Data;
++      finally T.Free; end;
++    until False;
++  end;
++
+   function ParseOptionFunctionParameter: String;
+   var
+     T: TToken;
+@@ -1233,6 +1394,7 @@
+     T: TToken;
+     Identifier: String;
+     SymbolIndex: Integer;
++    TypeName: string;
+   begin
+     T := NextToken;
+     If T.IsSymbol(SYM_LEFT_PARENTHESIS) then
+@@ -1283,21 +1445,41 @@
+       Result := BoolToInt64[IsSwitchDefined(ParseOptionFunctionParameter)]
+     else
+     if Identifier = 'sizeof' then
+-      raise EInvalidIfCondition.Create('Evaluating "sizeof" function for $if / $elseif not implemented', [])
++    begin
++      TypeName:=LowerCase(ParseTypeParameter);
++      if (TypeName='byte') or (TypeName='shortint') or (TypeName='ansichar') or (TypeName='boolean') then Result:=Int64(1)
++      else if (TypeName='word') or (TypeName='smallint') or (TypeName='char') or (TypeName='widechar') then Result:=Int64(2)
++      else if (TypeName='integer') or (TypeName='cardinal') or (TypeName='longint') or (TypeName='single') then Result:=Int64(4)
++      else if (TypeName='int64') or (TypeName='uint64') or (TypeName='double') then Result:=Int64(8)
++      else if (TypeName='pointer') or (TypeName='nativeint') or (TypeName='nativeuint') or (TypeName='string') then
++      begin if IsSymbolDefined('CPU64BITS') then Result:=Int64(8) else Result:=Int64(4); end
++      else
++      begin
++        SymbolIndex:=FSymbols.FindName('PAS2DOX_SIZEOF_'+TypeName);
++        if SymbolIndex<0 then raise EInvalidIfCondition.Create('SizeOf requires -DPAS2DOX_SIZEOF_Type=value for this type',[]);
++        Result:=ParseLiteral(FSymbols[SymbolIndex].Value);
++      end;
++    end
+     else
+     if Identifier = 'declared' then
+-      raise EInvalidIfCondition.Create('Evaluating "declared" function for $if / $elseif not implemented', [])
++    begin
++      TypeName:=ParseTypeParameter;
++      Result:=BoolToInt64[(FDeclarations.IndexOf(TypeName)>=0) or IsSymbolDefined('PAS2DOX_DECLARED_'+TypeName)];
++    end
+     else
+     begin
++      SymbolIndex := FConstants.FindName(Identifier);
++      if SymbolIndex<>-1 then Exit(EvaluateExpression(FConstants[SymbolIndex].Value));
+       SymbolIndex := FSymbols.FindName(Identifier);
+       if SymbolIndex <> -1 then
+       begin
+         If FSymbols[SymbolIndex].Value = '' then
+           raise EInvalidIfCondition.CreateFmt('Macro "%s" doesn''t have a value', [Identifier]);
+-        Result := ParseLiteral(FSymbols[SymbolIndex].Value);
++        Result := EvaluateExpression(FSymbols[SymbolIndex].Value);
+       end
+       else
+-        raise EInvalidIfCondition.CreateFmt('Unknown function or macro "%s" in $if / $elseif', [Identifier]);
++        Result:=Int64(0); // Delphi: unknown identifiers in IF evaluate as False.
++
+     end;
+   end;
+ 
+@@ -1317,6 +1499,11 @@
+     Operand: Int64;
+   begin
+     T := NextToken;
++    if T=nil then raise EInvalidIfCondition.Create('Incomplete conditional expression',[]);
++    if T.IsSymbol(SYM_MINUS) then
++    begin FreeAndNil(T); Exit(-ParseFunctionNegated); end;
++    if T.IsSymbol(SYM_PLUS) then
++    begin FreeAndNil(T); Exit(ParseFunctionNegated); end;
+     if T.IsKeyWord(KEY_NOT) then
+     begin
+       FreeAndNil(T);
+@@ -1359,6 +1546,8 @@
+         else
+         if T.IsKeyWord(KEY_MOD) then
+           Result := NeedInt64(Result) mod NeedInt64(ParseFunctionNegated)
++        else if T.IsKeyWord(KEY_SHL) then Result:=NeedInt64(Result) shl NeedInt64(ParseFunctionNegated)
++        else if T.IsKeyWord(KEY_SHR) then Result:=NeedInt64(Result) shr NeedInt64(ParseFunctionNegated)
+         else
+         if T.IsSymbol(SYM_ASTERISK) then
+         begin
+@@ -1508,25 +1697,26 @@
+     T := NextToken;
+     if Assigned(T) then
+     begin
+-      DoMessage(2, pmtWarning,
+-        'Token "%s" is ignored in $if / $elseif condition', [T.Description]);
++      DoError('Unexpected trailing token in conditional expression', []);
+       FreeAndNil(T);
+     end;
+   end;
+ 
+ begin
+-  Tokenizer := TTokenizer.Create(TStringStream.Create(Condition),
++  Inc(FEvaluationDepth);
++  if FEvaluationDepth>64 then
++  begin Dec(FEvaluationDepth); DoError('Recursive constant expression',[]); end;
++  Tokenizer := TTokenizer.Create(TStringStream.Create(#$FEFF+Condition,TEncoding.UTF8),
+     FOnMessage, FVerbosity, '$if / $elseif condition', '');
+   try
+     try
+-      Result := NeedBoolean(ParseExpression);
++      Result := ParseExpression;
+       CheckLastToken;
+     except
+       on E: EInvalidIfCondition do
+       begin
+-        DoMessage(2, pmtWarning,
+-          'Cannot evaluate this $if / $elseif condition, assuming that "%s" is true. Error message is: %s', [Condition, E.Message]);
+-        Result := true;
++        DoError('Cannot evaluate conditional expression: %s', [E.Message]);
++        Result:=False; // DoError always raises.
+       end;
+     end;
+ 
+@@ -1538,7 +1728,16 @@
+       FreeAndNil(T);
+     until false;
+     }
+-  finally FreeAndNil(Tokenizer) end;
++  finally FreeAndNil(Tokenizer); Dec(FEvaluationDepth); end;
++end;
++
++function TScanner.IfCondition(const Condition: String): Boolean;
++var Value: Variant;
++begin
++  Value:=EvaluateExpression(Condition);
++  if VarType(Value)<>varInt64 then DoError('Boolean conditional expression required',[]);
++  if (Value<>0) and (Value<>1) then DoError('Boolean conditional expression required',[]);
++  Result:=Value=1;
+ end;
+ 
+ end.
+--- a/PasDoc_Tokenizer.pas
++++ b/PasDoc_Tokenizer.pas
+@@ -1,3 +1,4 @@
++{ Pas2Dox modification 2026-11-10. See ORIGIN.md. }
+ {
+   Copyright 1998-2026 PasDoc developers.
+ 
+@@ -42,7 +43,7 @@
+ interface
+ 
+ uses
+-  Classes, Generics.Collections,
++  SysUtils, Classes, Generics.Collections,
+   PasDoc_Utils,
+   PasDoc_Types,
+   PasDoc_StreamUtils;
+@@ -285,6 +286,8 @@
+     { Contents of the string token, that is: the value of the string literal.
+       D only when MyType is TOK_STRING. }
+     StringContent: string;
++    RootLine: Integer; // Owning unit line for tokens from include files.
++    BodyRecorded: Boolean; // A pushed-back token must enter a routine body only once.
+ 
+     { Create a token of and assign the argument token type to @link(MyType) }
+     constructor Create(const TT: TTokenType);
+@@ -504,9 +507,11 @@
+   underscore, ASCII letter, ASCII digit, or non-ASCII character (Unicode letter/digit). }
+ function IsIdentifierOtherChar(const C: Char): Boolean;
+ 
++var DefaultInputEncoding: TEncoding;
++
+ implementation
+ 
+-uses SysUtils, Math;
++uses Math;
+ 
+ function KeyWordByName(const Name: string): TKeyword;
+ var
+@@ -636,7 +641,7 @@
+   FVerbosity := VerbosityLevel;
+   Line := 1;
+   {$ifdef STRING_UNICODE}
+-  StreamReader := TStreamReader.Create(AStream);
++  StreamReader := TStreamReader.Create(AStream, DefaultInputEncoding, True);
+   StreamReader.OwnStream;
+   {$else}
+   Stream := AStream;
+@@ -1194,49 +1199,80 @@
+ 
+ function TTokenizer.ReadLiteralString: TToken;
+ var
+-  c: Char;
++  C, Previous: Char;
++  QuoteCount, Run, I, Indent: Integer;
++  CurrentLine, Body: string;
++  Lines: TStringList;
+   Finished: Boolean;
+ begin
++  Result := TToken.Create(TOK_STRING);
++  Result.Data := QuoteChar;
++  QuoteCount := 1;
++  while PeekChar(C) and (C = QuoteChar) do
++  begin
++    ConsumeChar;
++    Inc(QuoteCount);
++    Result.Data := Result.Data + C;
++  end;
++  if (QuoteCount >= 3) and Odd(QuoteCount) and PeekChar(C) and CharInSet(C, [#10,#13]) then
++  begin
++    Previous := #0;
++    Lines := TStringList.Create;
++    try
++      CurrentLine := '';
++      while GetChar(C) <> 0 do
++      begin
++        HandleEOL(Previous,C,Line); Previous := C;
++        Result.Data := Result.Data + C;
++        if (C = QuoteChar) and (Trim(CurrentLine) = '') then
++        begin
++          Run := 1;
++          while PeekChar(C) and (C = QuoteChar) do
++          begin ConsumeChar; Inc(Run); Result.Data := Result.Data + C; end;
++          if Run = QuoteCount then
++          begin
++            Indent := Length(CurrentLine);
++            Body := '';
++            for I := 1 to Lines.Count-1 do
++            begin
++              if (Trim(Lines[I]) <> '') and (Length(Lines[I])-Length(TrimLeft(Lines[I])) < Indent) then
++                DoError('Multiline string line is less indented than its closing delimiter', []);
++              if I > 1 then Body := Body + #10;
++              Body := Body + Copy(Lines[I],Indent+1,MaxInt);
++            end;
++            Result.StringContent := Body;
++            Exit;
++          end;
++          CurrentLine := CurrentLine + StringOfChar(QuoteChar,Run);
++        end else if C = #13 then
++        begin Lines.Add(CurrentLine); CurrentLine := ''; end
++        else if C = #10 then
++        begin
++          if (Length(Result.Data)<2) or (Result.Data[Length(Result.Data)-1]<>#13) then Lines.Add(CurrentLine);
++          CurrentLine := '';
++        end else CurrentLine := CurrentLine + C;
++      end;
++      DoError('Unterminated multiline string literal', []);
++    finally Lines.Free; end;
++    Exit;
++  end;
++  if not Odd(QuoteCount) then
++  begin Result.StringContent := StringOfChar(QuoteChar,QuoteCount div 2-1); Exit; end;
++  Result.StringContent := StringOfChar(QuoteChar,(QuoteCount-1) div 2);
+   Finished := False;
+-
+-  Result := TToken.Create(TOK_STRING);
+-  Result.Data := '''';
+-
+   repeat
+-    if not HasData then begin
+-      FreeAndNil(Result);
+-      DoError('Tokenizer: unexpected end of stream', []);
++    if GetChar(C)=0 then DoError('Unterminated string literal', []);
++    Result.Data := Result.Data + C;
++    if C=QuoteChar then
++    begin
++      if PeekChar(C) and (C=QuoteChar) then
++      begin ConsumeChar; Result.Data:=Result.Data+QuoteChar; Result.StringContent:=Result.StringContent+QuoteChar; end
++      else Finished:=True;
++    end else
++    begin
++      if CharInSet(C,[#10,#13]) then DoError('Newline inside an ordinary string literal', []);
++      Result.StringContent := Result.StringContent + C;
+     end;
+-    if GetChar(c) = 0 then begin
+-      FreeAndNil(Result);
+-      DoError('Tokenizer: could not read character', []);
+-    end;
+-    if c = QuoteChar then begin
+-      if PeekChar(c) and (c = QuoteChar) then { escaped single quote within string } begin
+-        ConsumeChar;
+-        Result.Data := Result.Data + QuoteChar;
+-      end
+-      else { end of string } begin
+-        Finished := True;
+-      end;
+-      Result.Data := Result.Data + QuoteChar;
+-    end
+-    else
+-    if CharInSet(c, [#10, #13]) then
+-    begin
+-      FreeAndNil(Result);
+-      { Note: Do not show here exact code (#13 or #10) to make auto tests succeed,
+-        regardless of line endings in cloned repo (Windows or Linux). }
+-      DoError('Newline inside a literal string is not allowed', []);
+-    end
+-    else begin
+-      Result.Data := Result.Data + c;
+-    end;
+-    { Note that, because of logic above, this will append only ONE apostrophe
+-      when reading two apostrophes in source code.
+-      Checking Finished prevents adding the ending apostrophe. }
+-    if not Finished then
+-      Result.StringContent := Result.StringContent + c;
+   until Finished;
+ end;
+ 
+@@ -1328,4 +1364,7 @@
+   T := nil;
+ end;
+ 
++initialization
++  DefaultInputEncoding:=TEncoding.UTF8;
++
+ end.

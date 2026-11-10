@@ -1,0 +1,100 @@
+{
+  Copyright 1998-2018 PasDoc developers.
+
+  This file is part of "PasDoc".
+
+  "PasDoc" is free software; you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation; either version 2 of the License, or
+  (at your option) any later version.
+
+  "PasDoc" is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with "PasDoc"; if not, write to the Free Software
+  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA
+
+  ----------------------------------------------------------------------------
+}
+
+{ @abstract(Sorting settings types and names.) }
+unit PasDoc_SortSettings;
+
+{$I pasdoc_defines.inc}
+
+interface
+
+uses SysUtils;
+
+type
+  EInvalidSortSetting = class(Exception);
+
+  TSortSetting = (
+    // CIOs in a unit or nested in CIO.
+    ssCIOs,
+    // Constants in a unit or nested in CIO.
+    ssConstants,
+    // Routines in a unit.
+    ssFuncsProcs,
+    // Types in a unit.
+    ssTypes,
+    // Variables in a unit.
+    ssVariables,
+    // Uses clauses in a unit.
+    ssUsesClauses,
+    // Fields in a CIO that is a record.
+    ssRecordFields,
+    // Fields in a CIO that is not a record, like in a class or interface.
+    ssNonRecordFields,
+    // Methods in a CIO.
+    ssMethods,
+    // Properties in a CIO.
+    ssProperties
+  );
+  TSortSettings = set of TSortSetting;
+
+const
+  AllSortSettings: TSortSettings = [Low(TSortSetting) .. High(TSortSetting)];
+
+  { Must be lowercase.
+    Used in @link(SortSettingsToName), @link(SortSettingFromName). }
+  SortSettingNames: array[TSortSetting] of string = (
+    'structures', 'constants', 'functions', 'types', 'variables', 'uses-clauses',
+    'record-fields', 'non-record-fields', 'methods', 'properties' );
+
+{ @raises(EInvalidSortSetting if ASortSettingName does not match
+  (case ignored) to any SortSettingNames.) }
+function SortSettingFromName(const SortSettingName: string): TSortSetting;
+
+{ Comma-separated list }
+function SortSettingsToName(const SortSettings: TSortSettings): string;
+
+implementation
+
+function SortSettingFromName(const SortSettingName: string): TSortSetting;
+var S: string;
+begin
+  S := LowerCase(SortSettingName);
+  for Result := Low(Result) to High(Result) do
+    if S = SortSettingNames[Result] then
+      Exit;
+  raise EInvalidSortSetting.CreateFmt('Invalid sort specifier "%s"',
+    [SortSettingName]);
+end;
+
+function SortSettingsToName(const SortSettings: TSortSettings): string;
+var SS: TSortSetting;
+begin
+  Result := '';
+  for SS := Low(SS) to High(SS) do
+    if SS in SortSettings then
+    begin
+      if Result <> '' then Result := Result + ',';
+      Result := Result + SortSettingNames[SS];
+    end;
+end;
+
+end.

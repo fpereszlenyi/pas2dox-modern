@@ -1,0 +1,4540 @@
+{ Pas2Dox modification 2026-11-10. See ORIGIN.md. }
+{
+  Copyright 1998-2026 PasDoc developers.
+
+  This file is part of "PasDoc".
+
+  "PasDoc" is free software; you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation; either version 2 of the License, or
+  (at your option) any later version.
+
+  "PasDoc" is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with "PasDoc"; if not, write to the Free Software
+  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA
+
+  ----------------------------------------------------------------------------
+}
+
+{ @abstract(Parse Pascal code.)
+  @author(Ralf Junker (delphi@zeitungsjunge.de))
+  @author(Marco Schmidt (marcoschmidt@geocities.com))
+  @author(Johannes Berg <johannes@sipsolutions.de>)
+  @author(Michalis Kamburelis)
+  @author(Arno Garrels <first name.name@nospamgmx.de>)
+
+  Contains the @link(TParser) object, which can parse a Pascal
+  code, and put the collected information into the TPasUnit instance. }
+
+unit PasDoc_Parser;
+
+{$I pasdoc_defines.inc}
+
+interface
+
+uses SysUtils, Classes, Contnrs, StrUtils, Generics.Collections,
+  PasDoc_Types,
+  PasDoc_Items,
+  PasDoc_Scanner,
+  PasDoc_Tokenizer,
+  PasDoc_StringPairVector,
+  PasDoc_StringVector;
+
+type
+  { Raised when an impossible situation (indicating bug in
+    pasdoc) occurs. }
+  EInternalParserError = class(Exception);
+
+  { Are we currently inside a const, var, type section? }
+  TParsingSection = (psNone, psConst, psVar, psType);
+
+  { State of parsing a structure (called "CIO" throughout PasDoc codebase). }
+  TCioState = class(TObject)
+  private
+    FCio: TPasCio;
+    FVisibility: TVisibility;
+    FSection: TParsingSection;
+  public
+    { Structure (CIO) that is currently being parsed. }
+    property Cio: TPasCio read FCio write FCio;
+
+    { Current visibility (like public, private...) for members of this CIO. }
+    property Visibility: TVisibility read FVisibility write FVisibility;
+
+    { Are we inside a const, var, type section (nested in a class)? }
+    property Section: TParsingSection read FSection write FSection;
+
+    { Frees included objects and calls its own destructor.
+      Objects are not owned by default. }
+    procedure FreeAll;
+  end;
+
+  { A stack of @link(TCioState) objects currently used to parse nested
+    classes and records. }
+  TCioStateStack = class(Contnrs.TObjectStack)
+  public
+    { Frees all items including their CIOs and clears the stack }
+    procedure Clear;
+    function Push(const Item: TCioState): TCioState;
+    function Pop: TCioState;
+    function Peek: TCioState;
+  end;
+
+  // @name stores a series of @link(TRawDescriptionInfo TRawDescriptionInfos).
+  // It is modelled after TStringList but has only the minimum number
+  // of methods required for use in PasDoc.
+  TRawDescriptionInfoList = class(TObject)
+  private
+    // @name holds the @link(TRawDescriptionInfo TRawDescriptionInfos) in @classname
+    FItems: array of TRawDescriptionInfo;
+    // @name holds the number of items currently stored in @classname.
+    // @seealso(Count).
+    FCount: integer;
+    // @name is the read specifier for @link(Items)
+    function GetItems(Index: integer): TRawDescriptionInfo;
+    // @name expands the capacity of @link(FItems).
+    procedure Grow;
+  public
+    // @name adds a new @link(TRawDescriptionInfo) to @classname.
+    function Append(Comment: TRawDescriptionInfo): integer;
+    // @name is the number of @link(TRawDescriptionInfo TRawDescriptionInfos) in
+    // @classname.
+    property Count: integer read FCount;
+    Constructor Create;
+    // @name provides read access to the
+    // @link(TRawDescriptionInfo TRawDescriptionInfos) in @classname.
+    property Items[Index: integer]: TRawDescriptionInfo read GetItems; default;
+  end;
+
+  { Parser class that will process a complete unit file and all of its
+    include files, regarding directives.
+    When creating this object constructor @link(Create) takes as an argument
+    an input stream and a list of directives.
+    Parsing work is done by calling @link(ParseUnitOrProgram) method.
+    If no errors appear, should return a @link(TPasUnit) object with
+    all information on the unit. Else exception is raised.
+
+    Things that parser inits in items it returns:
+
+    @unorderedList(
+      @item(Of every TPasItem :
+        Name, RawDescription, Visibility, HintDirectives, DeprecatedNote,
+        FullDeclararation (note: for now not all items
+        get sensible FullDeclararation, but the intention is to improve this
+        over time; see @link(TPasItem.FullDeclaration) to know where
+        FullDeclararation is available now).
+
+        Note to IsDeprecated: parser inits it basing on hint directive
+        "deprecated" presence in source file; it doesn't handle the fact
+        that @@deprecated tag may be specified inside RawDescription.
+
+        Note to RawDescription: parser inits them from user's comments
+        that preceded given item in source file.
+        It doesn't handle the fact that @@member and @@value tags
+        may also assign RawDescription for some item.)
+
+      @item Of TPasCio: Ancestors, Fields, Methods, Properties, MyType.
+
+      @item Of TPasEnum: Members, FullDeclararation.
+
+      @item Of TPasRoutine: What.
+
+      @item Of TPasVarConst: FullDeclaration.
+
+      @item(Of TPasProperty: IndexDecl, FullDeclaration.
+        PropType, NoDefault, Stored, DefaultValue, Reader, Writer.
+        DefaultInClass.)
+
+      @item(Of TPasUnit; UsesUnits, Types, Variables, CIOs, Constants,
+        FuncsProcs.)
+    )
+
+    It doesn't init other values.
+    E.g. AbstractDescription or DetailedDescription of TPasItem
+    should be inited while expanding this item's tags.
+    E.g. SourceFileDateTime and SourceFileName of TPasUnit must
+    be set by other means. }
+
+  TParser = class
+  private
+    FImplicitVisibility: TImplicitVisibility;
+
+    FCioStack: TCioStateStack;
+
+    { Set by GetAndCheckNextToken to record filename/line of last consumed token.
+      This allows routines using GetAndCheckNextToken to set
+      TPasItem.SourceAbsoluteFileName and TPasItem.SourceLine. }
+    FLastParsedTokenStreamAbsoluteFileName: string;
+    FLastParsedTokenLine: Integer;
+    FLastParsedTokenRootLine: Integer;
+    FTypeDeclarationLine, FTypeDeclarationRootLine: Integer;
+    FTypeDeclarationFile: string;
+
+    { Last comment found in input.
+      This only takes into account normal comments, i.e. not back-comments.
+      Modified by @link(GetLastComment) and @link(PeekNextToken)
+      (and consequently by all @link(PeekNextToken) and @link(GetNextToken)
+      versions).
+
+      LastCommentContent is only the comment content, with comment braces
+      and markers already stripped. }
+    IsLastComment: boolean;
+    LastCommentWasCStyle, LastCommentHelpInsight: boolean;
+    LastCommentInfo: TRawDescriptionInfo;
+
+    AttributeIsPossible: boolean;
+    CurrentAttributes: TStringPairVector;
+
+    { The underlying scanner object. }
+    Scanner: TScanner;
+
+    FOnMessage: TPasDocMessageEvent;
+    FVerbosity: Cardinal;
+    FCommentMarkers: TStringList;
+    FIgnoreMarkers: TStringList;
+    FMarkersOptional: boolean;
+    FIgnoreLeading: string;
+    FShowVisibilities: TVisibilities;
+    FAutoBackComments: boolean;
+    FInfoMergeType: TInfoMergeType;
+    FKeepImplementation: Boolean;
+    FTodoUnit: TPasUnit; // Current parsed unit; non-owning.
+    FTodoRoutine: TPasRoutine; // Retained declaration even without graph capture.
+    FBodyRoutine: TPasRoutine;
+    procedure CaptureBodyToken(Token: TToken);
+  private
+
+    { These are the items that the next "back-comment"
+      (the comment starting with "<", see
+      @url(https://pasdoc.github.io/WhereToPlaceComments WhereToPlaceComments)
+      section "Placing comments after the item") will apply to. }
+    ItemsForNextBackComment: TPasItems;
+
+    { Returns @link(TRoutineType) value for corresponding @link(TKeyWord) value.
+      @raises(EInternalParserError
+        If given KeyWord has no corresponding @link(TRoutineType) value.) }
+    function KeyWordToRoutineType(KeyWord: TKeyWord): TRoutineType;
+
+    { Raise EPasDoc exception with given message. }
+    procedure DoError(const AMessage: string;
+      const AArguments: array of const);
+
+    { Generate a message, using OnMessage event. }
+    procedure DoMessage(const AVerbosity: Cardinal; const MessageType:
+      TPasDocMessageType; const AMessage: string; const AArguments: array of const);
+
+    { Checks if T.MyType is ATokenType, if not calls DoError
+      with appropriate error mesg. }
+    procedure CheckToken(T: TToken; ATokenType: TTokenType); overload;
+
+    { Checks if T.IsSymbol(ASymbolType), if not calls DoError
+      with appropriate error mesg. }
+    procedure CheckToken(T: TToken; ASymbolType: TSymbolType); overload;
+
+    { Checks if T.IsKeyWord(AKeyWord), if not calls DoError
+      with appropriate error mesg. }
+    procedure CheckToken(T: TToken; AKeyWord: TKeyWord); overload;
+
+    { Replaces HelpInsight XML tags like <summary> with PasDoc tags }
+    procedure ExpandHelpInsightDescriptions(var DescriptionInfo: TRawDescriptionInfo);
+
+    { Remove Lazarus %region declarations from a description,
+      see @url(http://wiki.freepascal.org/IDE_Window:_Editor_Options_Code_Folding#About_.7B.25Region.7D Lazarus region documentation). }
+    procedure RemoveRegionDeclarations(var DescriptionInfo: TRawDescriptionInfo);
+
+    { If not IsLastComment, then returns @link(EmptyRawDescriptionInfo)
+      otherwise returns LastCommentInfo and sets IsLastComment to false. }
+    function GetLastComment: TRawDescriptionInfo;
+
+    { Returns next token that was found (omitting whitespace and comments)
+      without advancing the scanner to the next token.
+      This reads tokens and throws them away as long as they are either whitespace
+      or comments.
+
+      Sets WhitespaceCollector to all the whitespace that was skipped.
+      (Does @italic(not) append them to WhitespaceCollector,
+      it @italic(sets) WhitespaceCollector to them, deleting previous
+      WhitespaceCollector value.)
+      The overloaded version with WhitespaceCollectorItem
+      @italic(appends) whitespace to WhitespaceCollectorItem.FullDeclaration
+      (unless WhitespaceCollectorItem is @nil).
+      Remember that whitespace is always consumed --- unlike the token itself
+      (which is not "eaten" by peek operation),
+      whitespace is consumed, so you @italic(must) capture it here, or lose it.
+
+      Comments are collected to [Is]LastCommentXxx properties, so that you can
+      use GetLastComment.
+
+      This token is equal to @code(Scanner.PeekToken).
+      Note that this token was @italic(peeked)
+      from the stream, i.e. the caller is still responsible for doing
+      @code(Scanner.ConsumeToken).
+      Calling this method twice in a row will return the same thing.
+
+      Always returns something non-nil (will raise exception in case
+      of problems, e.g. when stream ended).
+
+      Called should not free the resulting TToken instance @italic(unless
+      it executes Scanner.ConsumeToken), in which case it should free this. }
+    function PeekNextToken(out WhitespaceCollector: string): TToken; overload;
+    function PeekNextToken(const WhitespaceCollectorItem: TPasItem): TToken; overload;
+
+    { Peek next token. See @link(PeekNextToken(String)) for more details.
+      This just discards the collected whitespace. }
+    function PeekNextToken: TToken; overload;
+
+    { Returns next token that was found (omitting whitespace and comments),
+      advancing to the next token.
+      This collects whitespace just like @link(PeekNextToken).
+
+      Caller should always free the resulting TToken instance. }
+    function GetNextToken(out WhitespaceCollector: string): TToken; overload;
+
+    { Returns next token that was found (omitting whitespace and comments),
+      advancing to the next token.
+      This collects whitespace just like @link(PeekNextToken)
+      and appends them to WhitespaceCollectorItem.FullDeclaration
+      (if WhitespaceCollectorItem is not @nil)
+
+      Caller should always free the resulting TToken instance. }
+    function GetNextToken(const WhitespaceCollectorItem: TPasItem): TToken; overload;
+
+    { Returns next token that was found (omitting whitespace and comments),
+      advancing to the next token.
+
+      Similar to other GetNextToken overloads, this just ignores collected
+      whitespace. }
+    function GetNextToken: TToken; overload;
+
+    function GetNextTokenNotAttribute(const WhitespaceCollectorItem: TPasItem): TToken; overload;
+
+    { Returns next token that was found (omitting whitespace and comments),
+      advancing to the next token,
+      and checks is it ATokenType.
+
+      Returns the token @link(TToken.Data). }
+    function GetAndCheckNextToken(const ATokenType: TTokenType): string; overload;
+
+    { This does @link(GetNextToken), then checks is it a symbol with
+      ASymbolType (using @link(CheckToken)), then frees the token.
+      Returns token Data.
+      Just a comfortable routine. }
+    function GetAndCheckNextToken(ASymbolType: TSymbolType): string; overload;
+
+    { This does @link(GetNextToken), then checks is it a keyword with
+      AKeyWord (using @link(CheckToken)), then frees the token.
+      Returns token Data.
+      Just a comfortable routine. }
+    function GetAndCheckNextToken(AKeyWord: TKeyWord): string; overload;
+
+    { Parse qualified identifier, which is a series of identifiers separated by dots.
+      May be used for dotted unit names ("System.SysUtils.TStringList")
+      or really any other place where we can have qualified identifiers
+      (like "MyUnit.TMyClass.TMyNestedClass.TAnotherNestedClass.TOriginalType").
+      Returns the whole qualified identifier as a string. }
+    function ParseQualifiedIdentifier: String;
+
+    { Parse known type name, which may be "TMyType" or qualified "MyUnit.TMyClass.TMyType"
+      or built-in type ("String", which is a keyword for PasDoc). }
+    function ParseKnownTypeIdentifier: String;
+
+    { Parses a constructor, a destructor, a function or a procedure
+      or an operator (for FPC).
+      Resulting @link(TPasRoutine) item will be returned in M.
+
+      ClassKeywordString contains the keyword 'class'
+      in the exact spelling as it was found in input,
+      for class methods. Else it contains ''.
+
+      RoutineTypeString contains the keyword 'constructor', 'destructor',
+      'function' or 'procedure' or standard directive 'operator'
+      in the exact spelling as it was found in input.
+      You can specify RoutineTypeString = '', this way you avoid including
+      such keyword at the beginning of returned M.FullDeclaration.
+
+      RoutineType is used for the What field of the resulting TPasRoutine.
+      This should correspond to RoutineTypeString.
+
+      D may contain a description or nil. }
+    procedure ParseRoutine(out M: TPasRoutine;
+      const ClassKeywordString: string;
+      const RoutineTypeString: string; RoutineType: TRoutineType;
+      const RawDescriptionInfo: TRawDescriptionInfo;
+      const NeedName: boolean; InitItemsForNextBackComment: boolean;
+      const IsGeneric: String);
+
+    { Parse a structure (class, interface, more).
+      This is used to parse top-level structures only, after it exits
+      the FCioStack is always clear.
+
+      @param U Unit containing this item.
+      @param CioName Name of the structure, like "TMyClass".
+      @param(CioNameWithGeneric Name of the structure with potential "generic"
+        prefix, like "generic TMyClass", used in FPC.)
+      @param(CIOType Type of structure, see TCIOType.) }
+    procedure ParseCIO(const U: TPasUnit;
+      const CioName, CioNameWithGeneric: string; const CIOType: TCIOType;
+      const RawDescriptionInfo: TRawDescriptionInfo;
+      const IsInRecordCase: boolean);
+
+    { Parse a structure (class, interface, more).
+      Like @link(ParseCIO) but it can also be used for nested structures.
+
+      This starts parsing a new top-level CIO (when FCioStack empty)
+      or nested CIO (when FCioStack already contains parents).
+      It will start with ParseCioTypeDecl call to actually create TPasCio. }
+    procedure ParseCio_StartDeclaration(const U: TPasUnit;
+      const CioName, CioNameWithGeneric: string; const CIOType: TCIOType;
+      const RawDescriptionInfo: TRawDescriptionInfo;
+      const IsInRecordCase: Boolean);
+
+    { Continue parsing a structure (class, interface, more) that is now on top of FCioStack.
+      When calling this, FCioStack cannot be empty,
+      we will continue parsing using FCioStack top item. }
+    procedure ParseCio_SkipDeclaration(const U: TPasUnit;
+      const RawDescriptionInfo: TRawDescriptionInfo;
+      const IsInRecordCase: Boolean);
+
+    { Continue parsing a structure (class, interface, more) given as parameter
+      LCio. It should no longer be on top of FCioStack. }
+    procedure ParseCio_Continue(const U: TPasUnit;
+      LCio: TPasCio;
+      LSection: TParsingSection;
+      LVisibility: TVisibility;
+      const IsInRecordCase: Boolean);
+
+    { Parse members inside CIO, should be used after ParseCioTypeDecl. }
+    function ParseCioMembers(const ACio: TPasCio; var Section: TParsingSection;
+      const IsInRecordCase: Boolean; var Visibility: TVisibility): Boolean;
+
+    { Assume that T is "<" symbol, and parse everything up to a matching ">".
+      Append everything (including this "<") to Content string.
+      At the end, T is freed and nil. }
+    procedure ParseGenericTypeIdentifierList(var T: TToken; var Content: string);
+
+    { Parse CIO type declaration. Call this after reading
+      "TMyClass = class|interface|object|record" .
+
+      Creates a TPasCio instance in ACio.
+      Sets ACio to @nil if that was merely a forward declaration,
+      so we found semicolon as our next token.
+
+      This parses
+      - ancestors list (if any), i.e. "(ancestor1,ancestor2,...)"
+      - sealed, abstract etc.
+
+
+      This is used both for top-level CIOs and for nested CIOs. }
+    procedure ParseCioTypeDecl(out ACio: TPasCio;
+      const CioName, CioNameWithGeneric: string; const CIOType: TCIOType;
+      const RawDescriptionInfo: TRawDescriptionInfo; var Visibility: TVisibility);
+
+    procedure ParseRecordCase(const R: TPasCio; const SubCase: boolean);
+    procedure ParseConstant(out Constant: TPasConstant);
+
+    { Parses sections of items inside a unit interface, unit implementation,
+      or inside a standalone routine (not in a CIO).
+
+      This handles
+      @unorderedList(
+        @item(const (and resourcestring) section)
+        @item(var (and threadvar) section)
+        @item(type section)
+      )
+
+      At start, assumes that next token is a keyword starting the section.
+      This stops when it encounters a keyword that is not part of
+      given sections.
+
+      U is optional unit object. If it's assigned, parsed items will be added
+      to the corresponding list. If it's @nil, items will be just parsed and
+      immediately disposed. }
+    procedure ParseTVCSection(U: TPasUnit);
+
+    procedure ParseInterfaceSection(const U: TPasUnit);
+    procedure ParseImplementationSection(const U: TPasUnit);
+    procedure ParseProperty(out p: TPasProperty);
+
+    { Parse global type (when CioState = nil) or type within a CIO
+      (when CioState <> nil). }
+    procedure ParseType(const U: TPasUnit; const CioState: TCioState = nil);
+
+    { This assumes that you just read left parenthesis starting
+      an enumerated type. It finishes parsing of TPasEnum,
+      returning is as P. }
+    procedure ParseEnum(out p: TPasEnum; const Name: string;
+      const RawDescriptionInfo: TRawDescriptionInfo);
+
+    { Parse a strong type alias (with the "type" keyword),
+      assuming the "type" token has just been read.
+      See @link(TPasAliasType.IsStrongAlias) for what is a strong type alias. }
+    procedure ParseStrongTypeAlias(out P: TPasAliasType; const Name: string;
+      const RawDescriptionInfo: TRawDescriptionInfo);
+
+    procedure ParseUses(const U: TPasUnit);
+
+    { This parses the sequence of identifiers separated by commas
+      and ended by symbol FinalSymbol. More specifically in EBNF it parses
+        TOK_IDENTIFIER (SYM_COMMA TOK_IDENTIFIER)+ FinalSymbol
+      FinalSymbol must be something else than SYM_COMMA.
+      After executing this, next token (returned by GetNextToken and PeekNextToken)
+      will point to the next token right after FinalSymbol.
+      All found identifiers will be appended to Names.
+
+      If RawDescriptions <> nil then this will also get
+      all comments documenting the identifiers in Names
+      (it will append the same number of items to
+      RawDescriptions as it appended to Names).
+      The strategy how comments are assigned to item in this case is
+      described on @url(https://pasdoc.github.io/WhereToPlaceComments WhereToPlaceComments)
+      (see section "Multiple fields/variables in one declaration"). }
+    procedure ParseCommaSeparatedIdentifiers(Names: TStrings;
+      FinalSymbol: TSymbolType;
+      RawDescriptions: TRawDescriptionInfoList);
+
+    procedure ParseVariables(const U: TPasUnit);
+
+    { Parse one variables or fields clause
+      ("one clause" is something like
+        NAME1, NAME2, ... : TYPE;
+      i.e. a list of variables/fields sharing one type declaration.)
+
+      @param(Items If Items <> nil then it adds parsed variables/fields to Items.)
+      @param(Visibility will be assigned to Visibility of
+        each variable/field instance.)
+      @param(IsInRecordCase indicates if we're within record's case.
+        It's relevant only if OfObject is true.) }
+    procedure ParseFieldsVariables(Items: TPasItems;
+      OfObject: boolean; Visibility: TVisibility; IsInRecordCase: boolean;
+      const ClassKeyWordString: string = '');
+
+    { Read all tokens until you find a semicolon at brace-level 0 and
+      end-level (between "record" and "end" keywords) also 0.
+
+      Alternatively, also stops before reading "end" without beginning
+      "record" (so it can handle some cases where declaration doesn't end
+      with semicolon).
+
+      Alternatively, only if IsInRecordCase, also stops before reading
+      ')' without matching '('. That's because fields' declarations
+      inside record case may be terminated by just ')' indicating
+      that this case clause terminates, without a semicolon.
+
+      If you pass Item <> nil then all read data will be
+      appended to Item.FullDeclaration. Also hint directives
+      (Item.HintDirectives, Item.DeprecatedNote) may be set (to true/non-empty) if appropriate
+      hint directive will occur in source file. }
+    procedure SkipDeclaration(const Item: TPasItem; IsInRecordCase: boolean; const InitialEndLevel: Integer = 0);
+
+    procedure SetCommentMarkers(const Value: TStringList);
+
+    procedure SetIgnoreMarkers(const Value: TStringList);
+
+    { Consume a hint directive (platform, library or deprecated) as long as you
+      see one. Skips all whitespace and comments.
+      Sets the Item.HintDirectives and Item.DeprecatedNote as necessary.
+
+      Stops when PeekNextToken returns some token that is not a whitespace,
+      comment or hint directive.
+
+      If ConsumeFollowingSemicolon then we will also look for, and consume,
+      a semicolon following (any one of) the hint directives. This is a little
+      hazy, but parsing rules for hint directives *are* hazy, the semicolon
+      sometimes is optional and sometimes required, see tests/ok_hint_directives.pas
+      testcase.
+
+      If ExtendFullDeclaration then the hint directives (and eventual semicolons,
+      if ConsumeFollowingSemicolon) will also be added to the Item.FullDeclaration). }
+    procedure ParseHintDirectives(Item: TPasItem;
+      const ConsumeFollowingSemicolon: boolean = false;
+      const ExtendFullDeclaration: boolean = false);
+
+    procedure ParseUnit(U: TPasUnit);
+    procedure ParseProgram(U: TPasUnit);
+    procedure ParseProgramOrLibraryUses(U: TPasUnit);
+    procedure ParseLibrary(U: TPasUnit);
+    procedure AddDirectives(const Directives: TStringVector);
+
+  public
+    { Create a parser, initialize the scanner with input stream S.
+      All strings in SD are defined compiler directives. }
+    constructor Create(
+      const InputStream: TStream;
+      const Directives: TStringVector;
+      const IncludeFilePaths: TStringVector;
+      const OnMessageEvent: TPasDocMessageEvent;
+      const VerbosityLevel: Cardinal;
+      const AStreamName, AStreamAbsoluteFileName: string;
+      const AHandleMacros: boolean);
+
+    { Release all dynamically allocated memory. }
+    destructor Destroy; override;
+
+    { This does the real parsing work, creating U unit and parsing
+      InputStream and filling all U properties. }
+    procedure ParseUnitOrProgram(var U: TPasUnit);
+
+    property OnMessage: TPasDocMessageEvent read FOnMessage write FOnMessage;
+    property CommentMarkers: TStringList read FCommentMarkers write SetCommentMarkers;
+    property MarkersOptional: boolean read fMarkersOptional write fMarkersOptional;
+    property IgnoreLeading: string read FIgnoreLeading write FIgnoreLeading;
+    property IgnoreMarkers: TStringList read FIgnoreMarkers write SetIgnoreMarkers;
+    property ShowVisibilities: TVisibilities
+      read FShowVisibilities write FShowVisibilities;
+
+    { See command-line option @--implicit-visibility documentation at
+      @url(https://pasdoc.github.io/ImplicitVisibilityOption --implicit-visibility documentation). }
+    property ImplicitVisibility: TImplicitVisibility
+      read FImplicitVisibility write FImplicitVisibility;
+    { See command-line option @--auto-back-comments documentation at
+      @url(https://pasdoc.github.io/AutoBackComments --auto-back-comments documentation). }
+    property AutoBackComments: boolean read FAutoBackComments write FAutoBackComments;
+    { Whether to read comments from the implementation,
+      and how to merge them with the interface comments. }
+    property InfoMergeType: TInfoMergeType read FInfoMergeType write FInfoMergeType;
+    property KeepImplementation: Boolean read FKeepImplementation write FKeepImplementation;
+  end;
+
+implementation
+
+uses
+  PasDoc_Utils;
+
+{ Extend full Pascal declaration of something by NextToken.
+  Makes sure to delimit by space if necessary. }
+function AppendDeclaration(const FullDeclaration, NextToken: String): String;
+const
+  NonSymbol = ['0'..'9', 'a'..'z', 'A'..'Z', '_'];
+var
+  LastFullDeclaration, FirstNextToken: Char;
+begin
+  if FullDeclaration <> '' then
+    LastFullDeclaration := FullDeclaration[Length(FullDeclaration)]
+  else
+    LastFullDeclaration := #0;
+
+  if NextToken <> '' then
+    FirstNextToken := NextToken[1]
+  else
+    FirstNextToken := #0;
+
+  if CharInSet(LastFullDeclaration, [':', ';']) then
+    { Put space after ':' to make type declarations like "const Key: String" in FullDeclaration. }
+    Result := FullDeclaration + ' ' + NextToken
+  else
+  if CharInSet(LastFullDeclaration, NonSymbol) and
+     CharInSet(FirstNextToken, NonSymbol) then
+    { Separate 2 non-symbols by space.
+      This way e.g. parsing "property MetadataBoolean[const Key: String]" results in FullDeclaration
+      with space between "const" and "Key". }
+    Result := FullDeclaration + ' ' + NextToken
+  else
+    Result := FullDeclaration + NextToken;
+end;
+
+function KeyWordToCioType(const KeyWord: TKeyword; const IsPacked: Boolean): TCIOType;
+begin
+  if not IsPacked then
+    case KeyWord of
+      KEY_CLASS:         Result := CIO_CLASS;
+      KEY_OBJCCLASS:     Result := CIO_OBJCCLASS;
+      KEY_DISPINTERFACE: Result := CIO_DISPINTERFACE;
+      KEY_INTERFACE:     Result := CIO_INTERFACE;
+      KEY_OBJECT:        Result := CIO_OBJECT;
+      KEY_RECORD:        Result := CIO_RECORD;
+      else               raise EInternalParserError.Create('KeyWordToCioType: invalid keyword');
+    end
+  else
+    case KeyWord of
+      KEY_CLASS:         Result := CIO_PACKEDCLASS;
+      KEY_OBJCCLASS:     Result := CIO_PACKEDOBJCCLASS;
+      KEY_OBJECT:        Result := CIO_PACKEDOBJECT;
+      KEY_RECORD:        Result := CIO_PACKEDRECORD;
+      else               raise EInternalParserError.Create('KeyWordToCioType: invalid keyword');
+    end;
+end;
+
+{ ---------------------------------------------------------------------------- }
+{ TParser }
+{ ---------------------------------------------------------------------------- }
+
+constructor TParser.Create(
+  const InputStream: TStream;
+  const Directives: TStringVector;
+  const IncludeFilePaths: TStringVector;
+  const OnMessageEvent: TPasDocMessageEvent;
+  const VerbosityLevel: Cardinal;
+  const AStreamName, AStreamAbsoluteFileName: string;
+  const AHandleMacros: boolean);
+begin
+  inherited Create;
+  FOnMessage := OnMessageEvent;
+  FVerbosity := VerbosityLevel;
+
+  Scanner := TScanner.Create(InputStream, OnMessageEvent,
+    VerbosityLevel, AStreamName, AStreamAbsoluteFileName, AHandleMacros);
+  Scanner.OnConsumedToken := CaptureBodyToken;
+  AddDirectives(Directives);
+  Scanner.IncludeFilePaths := IncludeFilePaths;
+  FCommentMarkers := TStringlist.Create;
+  FIgnoreMarkers := TStringlist.Create;
+  ItemsForNextBackComment := TPasItems.Create(false);
+  CurrentAttributes := TStringPairVector.Create(true);
+end;
+
+{ ---------------------------------------------------------------------------- }
+
+destructor TParser.Destroy;
+begin
+  CurrentAttributes.Free;
+  FCommentMarkers.Free;
+  FIgnoreMarkers.Free;
+  Scanner.Free;
+  ItemsForNextBackComment.Free;
+  inherited;
+end;
+
+{ ---------------------------------------------------------------------------- }
+
+function TParser.KeyWordToRoutineType(KeyWord: TKeyWord): TRoutineType;
+begin
+  case KeyWord of
+    KEY_CONSTRUCTOR: Result := ROUTINE_CONSTRUCTOR;
+    KEY_DESTRUCTOR:  Result := ROUTINE_DESTRUCTOR;
+    KEY_FUNCTION:    Result := ROUTINE_FUNCTION;
+    KEY_PROCEDURE:   Result := ROUTINE_PROCEDURE;
+  else
+    raise EInternalParserError.Create('KeyWordToRoutineType: invalid keyword');
+  end;
+end;
+
+{ ---------------------------------------------------------------------------- }
+
+procedure TParser.DoError(const AMessage: string;
+  const AArguments: array of const);
+begin
+  raise EPasDoc.Create(Scanner.GetStreamInfo + ': ' + AMessage, AArguments, 1);
+end;
+
+{ ---------------------------------------------------------------------------- }
+
+procedure TParser.DoMessage(const AVerbosity: Cardinal; const MessageType:
+  TPasDocMessageType; const AMessage: string; const AArguments: array of const);
+begin
+  if (AVerbosity <= FVerbosity) and Assigned(FOnMessage) then
+    FOnMessage(MessageType, Format(AMessage, AArguments), AVerbosity);
+end;
+
+procedure TParser.ExpandHelpInsightDescriptions(var DescriptionInfo: TRawDescriptionInfo);
+begin
+  { Keep XML intact; the Doxygen backend converts it. }
+end;
+
+procedure TParser.RemoveRegionDeclarations(var DescriptionInfo: TRawDescriptionInfo);
+begin
+  if IsPrefix('%region /fold', DescriptionInfo.Content) then
+    DescriptionInfo.Content := RemovePrefix('%region /fold', DescriptionInfo.Content)
+  else
+  if IsPrefix('%region', DescriptionInfo.Content) then
+    DescriptionInfo.Content := RemovePrefix('%region', DescriptionInfo.Content)
+  else
+  if IsPrefix('%endregion', DescriptionInfo.Content) then
+    DescriptionInfo.Content := RemovePrefix('%endregion', DescriptionInfo.Content);
+end;
+
+{ ---------------------------------------------------------------------------- }
+
+const
+  SExpectedButFound = '%s expected but %s found';
+
+procedure TParser.CheckToken(T: TToken; ATokenType: TTokenType);
+begin
+  if T.MyType <> ATokenType then
+    DoError(SExpectedButFound,
+      [TOKEN_TYPE_NAMES[ATokenType], T.Description]);
+end;
+
+procedure TParser.CheckToken(T: TToken; ASymbolType: TSymbolType);
+begin
+  if not T.IsSymbol(ASymbolType) then
+    DoError(SExpectedButFound,
+      [Format('symbol "%s"', [SymbolNames[ASymbolType]]), T.Description]);
+end;
+
+procedure TParser.CheckToken(T: TToken; AKeyWord: TKeyWord);
+begin
+  if not T.IsKeyWord(AKeyWord) then
+    DoError(SExpectedButFound,
+      [Format('reserved word "%s"', [LowerCase(KeyWordArray[AKeyWord])]),
+      T.Description]);
+end;
+
+{ ---------------------------------------------------------------------------- }
+
+function TParser.GetLastComment: TRawDescriptionInfo;
+begin
+  if IsLastComment then
+  begin
+    if LastCommentHelpInsight then
+      ExpandHelpInsightDescriptions(LastCommentInfo);
+    RemoveRegionDeclarations(LastCommentInfo);
+    Result := LastCommentInfo;
+    IsLastComment := false;
+  end else
+    Result := EmptyRawDescriptionInfo;
+end;
+
+{ ---------------------------------------------------------------------------- }
+
+procedure TParser.CaptureBodyToken(Token: TToken);
+begin
+  if (FBodyRoutine=nil) or (Token=nil) or Token.BodyRecorded or
+    (Token.MyType in [TOK_WHITESPACE,TOK_COMMENT_PAS,TOK_COMMENT_EXT,
+      TOK_COMMENT_HELPINSIGHT,TOK_COMMENT_CSTYLE,TOK_DIRECTIVE]) then Exit;
+  Token.BodyRecorded:=True;
+  if FBodyRoutine.BodyLine=0 then FBodyRoutine.BodyLine:=Token.Line;
+  case Token.MyType of
+    TOK_STRING, TOK_DOUBLE_QUOTED_STRING: FBodyRoutine.BodyTokens.Add('''literal''');
+    TOK_NUMBER: FBodyRoutine.BodyTokens.Add('0');
+  else FBodyRoutine.BodyTokens.Add(Token.Data); end;
+end;
+
+function TParser.GetNextToken(out WhitespaceCollector: string): TToken;
+begin
+  Result := PeekNextToken(WhitespaceCollector);
+  Scanner.ConsumeToken;
+end;
+
+function TParser.GetNextToken(const WhitespaceCollectorItem: TPasItem): TToken;
+begin
+  Result := PeekNextToken(WhitespaceCollectorItem);
+  Scanner.ConsumeToken;
+end;
+
+function TParser.GetNextToken: TToken;
+begin
+  Result := PeekNextToken;
+  Scanner.ConsumeToken;
+end;
+
+function TParser.GetNextTokenNotAttribute(const WhitespaceCollectorItem: TPasItem): TToken;
+var
+  OldAttributeIsPossible: Boolean;
+begin
+  OldAttributeIsPossible := AttributeIsPossible;
+  AttributeIsPossible := False;
+  Result := GetNextToken(WhitespaceCollectorItem);
+  AttributeIsPossible := OldAttributeIsPossible;
+end;
+
+{ ---------------------------------------------------------------------------- }
+
+function TParser.GetAndCheckNextToken(const ATokenType: TTokenType): string;
+var
+  T: TToken;
+begin
+  T := GetNextToken;
+  try
+    CheckToken(T, ATokenType);
+    Result := T.Data;
+    FLastParsedTokenStreamAbsoluteFileName := T.StreamAbsoluteFileName;
+    FLastParsedTokenLine := T.Line;
+    FLastParsedTokenRootLine := T.RootLine;
+  finally
+    T.Free;
+  end;
+end;
+
+function TParser.ParseQualifiedIdentifier: String;
+var
+  S: string;
+  T: TToken;
+begin
+  Result := '';
+  while true do
+  begin
+    Result := Result + GetAndCheckNextToken(TOK_IDENTIFIER);
+    T := PeekNextToken(s);
+    if (s = '') and T.IsSymbol(SYM_PERIOD) then
+    begin
+      Result := Result + '.';
+      Scanner.ConsumeToken;
+      T.Free;
+    end else
+      Exit;
+  end;
+end;
+
+function TParser.ParseKnownTypeIdentifier: String;
+var
+  T: TToken;
+begin
+  T := PeekNextToken;
+  if (T.MyType = TOK_KEYWORD) and
+     (T.Info.KeyWord = KEY_STRING) then
+  begin
+    Result := T.Data;
+    Scanner.ConsumeToken;
+    FreeAndNil(T);
+  end else
+    Result := ParseQualifiedIdentifier;
+end;
+
+function TParser.GetAndCheckNextToken(ASymbolType: TSymbolType): string;
+var
+  T: TToken;
+begin
+  T := GetNextToken;
+  try
+    CheckToken(T, ASymbolType);
+    Result := T.Data;
+    FLastParsedTokenStreamAbsoluteFileName := T.StreamAbsoluteFileName;
+    FLastParsedTokenLine := T.Line;
+    FLastParsedTokenRootLine := T.RootLine;
+  finally
+    T.Free;
+  end;
+end;
+
+function TParser.GetAndCheckNextToken(AKeyWord: TKeyWord): string;
+var
+  T: TToken;
+begin
+  T := GetNextToken;
+  try
+    CheckToken(T, AKeyWord);
+    Result := T.Data;
+    FLastParsedTokenStreamAbsoluteFileName := T.StreamAbsoluteFileName;
+    FLastParsedTokenLine := T.Line;
+    FLastParsedTokenRootLine := T.RootLine;
+  finally
+    T.Free;
+  end;
+end;
+
+{ ---------------------------------------------------------------------------- }
+
+procedure TParser.ParseRoutine(out M: TPasRoutine;
+  const ClassKeywordString: string;
+  const RoutineTypeString: string; RoutineType: TRoutineType;
+  const RawDescriptionInfo: TRawDescriptionInfo;
+  const NeedName: boolean; InitItemsForNextBackComment: boolean;
+  const IsGeneric: String);
+
+  procedure ReadNestedName;
+  var t: TToken;
+  begin
+    t := nil;
+    repeat
+      FreeAndNil(t);
+      t := GetNextToken;
+      if (t.MyType = TOK_IDENTIFIER) or t.IsSymbol(SYM_PERIOD) then
+        M.Name := M.Name + t.Data
+      else
+      // Whitespaces are allowed ("function TClass . Foo"), just skip them
+      if t.MyType = TOK_WHITESPACE then
+        // skip
+      else
+      begin
+        Scanner.UnGetToken(t);
+        Break;
+      end;
+    until False;
+  end;
+
+  { Reads tokens (adding them to M.FullDeclaration) until a semicolon
+    (on parenthesis level zero) is found (this final semicolon
+    is also read and appended to M.FullDeclaration). }
+  procedure ReadTokensUntilSemicolon;
+  var
+    T: TToken;
+    Level: Integer;
+    IsSemicolon: Boolean;
+  begin
+    Level := 0;
+    repeat
+      T := Scanner.GetToken;
+      try
+        if T.MyType = TOK_WHITESPACE then
+        begin
+          { add exactly *one space* at the end of M.FullDeclaration }
+          if Length(M.FullDeclaration) > 0 then
+          begin
+            if (M.FullDeclaration[Length(M.FullDeclaration)] <> ' ') then
+              M.FullDeclaration := M.FullDeclaration + ' ';
+          end;
+        end else
+        if not (T.MyType in TokenCommentTypes) then
+          M.FullDeclaration := M.FullDeclaration + T.Data;
+
+        if T.IsSymbol(SYM_LEFT_PARENTHESIS) then Inc(level);
+        if T.IsSymbol(SYM_RIGHT_PARENTHESIS) then Dec(level);
+        IsSemicolon := T.IsSymbol(SYM_SEMICOLON);
+      finally
+        FreeAndNil(T);
+      end;
+    until IsSemicolon and (Level = 0);
+  end;
+
+  function IsParameterIdentifier(Token: TToken): Boolean;
+  begin
+    if Token.MyType = TOK_IDENTIFIER then
+      { SD_OUT is a parameter modifier (like const, var), not a parameter name }
+      Result := not (Token.Info.StandardDirective in [SD_OUT])
+    else if Token.MyType = TOK_KEYWORD then
+    begin
+      Result := Token.Info.KeyWord in [KEY_STRING, KEY_ARRAY, KEY_SET, KEY_OF, KEY_FILE];
+    end
+    else
+      Result := False;
+  end;
+
+  procedure ReadParameters;
+  var
+    T: TToken;
+    Level: Integer;
+    IsSemicolon: Boolean;
+    ParamsInGroup: Integer;
+    TypeNamePartStarted: Boolean;
+    TypeNamePartEnded: Boolean;
+    ParamEnded: Boolean;
+    I: Integer;
+    TypeName: String;
+  begin
+    Level := 0;
+    ParamsInGroup := 0;
+    TypeNamePartStarted := False;
+    TypeNamePartEnded := False;
+    ParamEnded := False;
+    TypeName := '';
+    repeat
+      T := Scanner.GetToken;
+      try
+        if T.MyType = TOK_WHITESPACE then
+        begin
+          { add exactly *one space* at the end of M.FullDeclaration }
+          if Length(M.FullDeclaration) > 0 then
+          begin
+            if (M.FullDeclaration[Length(M.FullDeclaration)] <> ' ') then
+              M.FullDeclaration := M.FullDeclaration + ' ';
+          end;
+        end else
+        if not (T.MyType in TokenCommentTypes) then
+          M.FullDeclaration := M.FullDeclaration + T.Data;
+
+        if Level > 0 then
+        begin
+          if T.IsSymbol(SYM_COLON) then
+            TypeNamePartStarted := True
+          else if T.IsSymbol(SYM_EQUAL) then
+            // Any identifiers after the equals are NOT parameters
+            TypeNamePartEnded := True
+          else if (not TypeNamePartEnded) and IsParameterIdentifier(T) then
+          begin
+            if TypeNamePartStarted then
+              TypeName := IfThen(TypeName = '', '', TypeName + ' ') + T.Data
+            else
+              Inc(ParamsInGroup);
+          end
+          else if T.IsSymbol(SYM_SEMICOLON) or T.IsSymbol(SYM_LEFT_PARENTHESIS)
+            or T.IsSymbol(SYM_RIGHT_PARENTHESIS) then
+            ParamEnded := True;
+        end;
+
+        if ParamEnded then
+        begin
+          if TypeName = '' then TypeName := 'const';
+
+           for I := 0 to ParamsInGroup - 1 do
+            M.ParamTypes.Add(TypeName);
+
+          TypeName := '';
+          TypeNamePartStarted := False;
+          TypeNamePartEnded := False;
+          ParamEnded := False;
+          ParamsInGroup := 0;
+        end;
+
+        if T.IsSymbol(SYM_LEFT_PARENTHESIS) then Inc(level);
+        if T.IsSymbol(SYM_RIGHT_PARENTHESIS) then Dec(level);
+        IsSemicolon := T.IsSymbol(SYM_SEMICOLON);
+      finally
+        FreeAndNil(T);
+      end;
+    until IsSemicolon and (Level = 0);
+
+    for I := 0 to ParamsInGroup - 1 do
+      M.ParamTypes.Add('const');
+  end;
+
+var
+  t: TToken;
+  InvalidType, WasDeprecatedDirective: boolean;
+  LGenericParams: string;
+begin
+  t := nil;
+  WasDeprecatedDirective := false;
+  M := TPasRoutine.Create;
+  try
+    M.RawDescriptionInfo^ := RawDescriptionInfo;
+    M.SetAttributes(CurrentAttributes);
+
+    M.What := RoutineType;
+
+    if IsGeneric <> '' then
+      M.FullDeclaration := SAppendPart(M.FullDeclaration, ' ', IsGeneric);
+    if ClassKeyWordString <> '' then
+      M.FullDeclaration := SAppendPart(M.FullDeclaration, ' ', ClassKeyWordString);
+    M.FullDeclaration := SAppendPart(M.FullDeclaration, ' ', RoutineTypeString);
+
+    { next non-wc token must be the name }
+    if NeedName then
+    begin
+      t := GetNextToken;
+
+      if (RoutineType = ROUTINE_OPERATOR) then
+      begin
+        { In FPC operators "or", "and", "xor" (expressed as keywords) can be
+          overloaded, also symbolic operators like "+", "*" etc..
+          In Delphi 2006+ "operator" is followed by identifiers like
+          "Implicit", "Explicit" or "LogicalNot",  "BitwiseAnd" etc.. }
+        InvalidType := (t.MyType <> TOK_IDENTIFIER) and
+                       (t.MyType <> TOK_SYMBOL) and (t.MyType <> TOK_KEYWORD);
+      end
+      else
+        InvalidType := (t.MyType <> TOK_IDENTIFIER) and (t.MyType <> TOK_KEYWORD);
+
+      if InvalidType then
+        DoError('Unexpected token %s', [T.Description]);
+
+      M.SourceAbsoluteFileName := t.StreamAbsoluteFileName;
+      M.SourceLine := t.Line;
+      M.SourceRootLine := t.RootLine;
+
+      { Consume all following period-delimited identifiers as a single name.
+        Actual only when reading impl section. Resulting name requires additional
+        processing (splitting to class and method names).
+        Not used for FPC keyword and symbol operators }
+      if (t.MyType <> TOK_IDENTIFIER) then
+        M.Name := t.Data
+      else
+      begin
+        Scanner.UnGetToken(t);
+        ReadNestedName;
+      end;
+
+      DoMessage(5, pmtInformation, 'Parsing %s "%s"',
+        [RoutineTypeToString(RoutineType), M.Name]);
+      M.FullDeclaration := M.FullDeclaration + ' ' + M.Name;
+      FreeAndNil(t);
+
+      { Allow generic type parameters on methods, like "function Call<A; R>(...)". }
+      t := GetNextToken;
+      if t.IsSymbol(SYM_LESS_THAN) then
+      begin
+        LGenericParams := M.FullDeclaration;
+        ParseGenericTypeIdentifierList(t, LGenericParams);
+        M.FullDeclaration := LGenericParams;
+      end
+      else
+        Scanner.UnGetToken(t);
+      FreeAndNil(t);
+    end;
+
+    ReadParameters;
+
+    { This must be after the parameters are read, as TPasRoutine.Signature is generated from the parameters. }
+    if InitItemsForNextBackComment then
+      ItemsForNextBackComment.ClearAndAdd(M);
+
+    { first get non-WC token - if it is not an identifier in SD_SET put it back
+      into stream and leave; otherwise copy tokens until semicolon }
+    repeat
+      FreeAndNil(t);
+      t := GetNextToken;
+
+      if t.MyType = TOK_IDENTIFIER then
+      begin
+        case t.Info.StandardDirective of
+          SD_ABSTRACT, SD_ASSEMBLER, SD_CDECL, SD_DYNAMIC, SD_EXPORT,
+          SD_FAR, SD_FORWARD, SD_NEAR, SD_NORETURN, SD_OVERLOAD, SD_OVERRIDE, SD_INLINE,
+          SD_PASCAL, SD_REGISTER, SD_SAFECALL, SD_STATIC,
+          SD_STDCALL, SD_WINAPI, SD_REINTRODUCE, SD_VIRTUAL,
+          SD_VARARGS, SD_FINAL:
+            begin
+              M.Directives := M.Directives + [t.Info.StandardDirective];
+              M.FullDeclaration := M.FullDeclaration + ' ' + t.Data;
+              FreeAndNil(t);
+              t := GetNextToken;
+            end;
+
+          { * External declarations might be followed by a string constant.
+            * Messages are followed by an integer constant between 1 and 49151 which
+              specifies the message ID.
+            * Deprecated might be followed by a string constant since D2010. }
+          SD_EXTERNAL, SD_MESSAGE, SD_NAME, SD_DEPRECATED:
+            begin
+              M.Directives := M.Directives + [t.Info.StandardDirective];
+
+              WasDeprecatedDirective := t.Info.StandardDirective = SD_DEPRECATED;
+              if WasDeprecatedDirective then
+                M.HintDirectives := M.HintDirectives + [hdDeprecated];
+              M.FullDeclaration := M.FullDeclaration + ' ' + t.Data;
+              FreeAndNil(t);
+
+              // Keep on reading up to the next semicolon or declaration
+              repeat
+                t := GetNextToken;
+                if t.IsSymbol(SYM_SEMICOLON) then
+                  Break;
+                { Some directives mean that the next part starts immediately,
+                  without a semicolon between. For example,
+                  "deprecated platform" may be placed after a procedure
+                  (without a semicolon after "deprecated"). }
+                if t.MyType = TOK_IDENTIFIER then
+                  case t.Info.StandardDirective of
+                    SD_ABSTRACT, SD_ASSEMBLER, SD_CDECL, SD_DYNAMIC, SD_EXPORT,
+                    SD_EXTERNAL,
+                    SD_FAR, SD_FORWARD, SD_NEAR, SD_NORETURN, SD_OVERLOAD, SD_OVERRIDE,
+                    SD_PASCAL, SD_REGISTER, SD_SAFECALL, SD_STATIC,
+                    SD_STDCALL, SD_WINAPI, SD_REINTRODUCE, SD_VIRTUAL,
+                    SD_DEPRECATED, SD_PLATFORM, SD_EXPERIMENTAL,
+                    SD_UNIMPLEMENTED:
+                      begin
+                        M.Directives := M.Directives + [t.Info.StandardDirective];
+                        Scanner.UnGetToken(t);
+                        Break;
+                      end;
+                  end;
+                if WasDeprecatedDirective then
+                begin
+                  if T.MyType = TOK_STRING then
+                    M.DeprecatedNote := M.DeprecatedNote + T.StringContent else
+                    { end WasDeprecatedDirective on non-string token, summing
+                      all previous string tokens into M.DeprecatedNote }
+                    WasDeprecatedDirective := false;
+                end;
+                M.FullDeclaration := M.FullDeclaration + ' ' + t.Data;
+                FreeAndNil(t);
+              until False;
+            end;
+          SD_PLATFORM:
+            begin
+              M.FullDeclaration := M.FullDeclaration + ' ' + t.Data;
+              M.HintDirectives := M.HintDirectives + [hdPlatform];
+              FreeAndNil(t);
+              t := GetNextToken;
+            end;
+          SD_EXPERIMENTAL:
+            begin
+              M.FullDeclaration := M.FullDeclaration + ' ' + t.Data;
+              M.HintDirectives := M.HintDirectives + [hdExperimental];
+              FreeAndNil(t);
+              t := GetNextToken;
+            end;
+          SD_UNIMPLEMENTED:
+            begin
+              M.FullDeclaration := M.FullDeclaration + ' ' + t.Data;
+              M.HintDirectives := M.HintDirectives + [hdUnimplemented];
+              FreeAndNil(t);
+              t := GetNextToken;
+            end;
+          SD_DISPID:
+            begin
+              M.FullDeclaration := M.FullDeclaration + ' ' + t.Data;
+              FreeAndNil(T);
+
+              ReadTokensUntilSemicolon;
+
+              t := GetNextToken;
+            end;
+        else //case
+            Scanner.UnGetToken(t);
+            Break;
+        end; // case
+      end else
+      if t.MyType = TOK_KEYWORD then
+      begin
+        case t.Info.KeyWord of
+          KEY_INLINE: begin
+              M.FullDeclaration := M.FullDeclaration + ' ' + t.Data;
+              FreeAndNil(t);
+              t := GetNextToken;
+            end;
+          KEY_LIBRARY:
+            begin
+              M.FullDeclaration := M.FullDeclaration + ' ' + t.Data;
+              M.HintDirectives := M.HintDirectives + [hdLibrary];
+              FreeAndNil(t);
+              t := GetNextToken;
+            end;
+          else
+            begin
+              Scanner.UnGetToken(t);
+              Break;
+            end;
+        end;
+      end else
+      begin
+        Scanner.UnGetToken(t);
+        Break;
+      end;
+
+      { Directives don't have to be separated and be terminated by a semicolon.
+        This is known at least for combination "deprecated platform".
+        Apparently, some Delphi versions also allowed not using semicolon
+        at other places (and we have to mimic compiler behavior, not only
+        documented behavior, since in practice people (over)use everything
+        that compiler allows).
+
+        So, check is current token a semicolon and append to FullDeclaration.
+        Note that T may be nil now (e.g. because we used UnGetToken last). }
+      if (t <> nil) and t.IsSymbol(SYM_SEMICOLON) then
+        M.FullDeclaration := M.FullDeclaration + ';'
+      else begin
+        M.FullDeclaration := M.FullDeclaration + ' ';
+        if t <> nil then Scanner.UnGetToken(t);
+      end;
+    until False;
+  except
+    M.Free;
+    t.Free;
+    raise;
+  end;
+end;
+
+{ ---------------------------------------------------------------------------- }
+
+procedure TParser.ParseCIO(const U: TPasUnit;
+  const CioName, CioNameWithGeneric: string; const CIOType: TCIOType;
+  const RawDescriptionInfo: TRawDescriptionInfo;
+  const IsInRecordCase: boolean);
+var
+  SavedStack: TCioStateStack;
+begin
+  { Each execution of ParseCIO saves and replaces the FCioStack
+    with a new empty one.
+
+    This is necessary because ParseCIO can be called for anonymous
+    inline records (e.g. "FField: record ... end;", see testcase
+    ok_inline_record_in_class.pas) while the outer
+    class/record is being parsed. Without saving/restoring, the
+    anonymous record parsing would incorrectly pop entries from the
+    outer CIO stack. }
+  SavedStack := FCioStack;
+  try
+    FCioStack := TCioStateStack.Create;
+    try
+      ParseCio_StartDeclaration(U, CioName, CioNameWithGeneric, CIOType, RawDescriptionInfo,
+        IsInRecordCase);
+    finally
+      FCioStack.Clear;
+      FCioStack.Free;
+    end;
+  finally
+    FCioStack := SavedStack;
+  end;
+end;
+
+{ ---------------------------------------------------------------------------- }
+procedure TParser.ParseConstant(out Constant: TPasConstant);
+var
+  t: TToken;
+  WhitespaceCollector: string;
+
+  { Same as SkipDeclaration() except that it returns TRUE if we hit a  }
+  { procedural constant, it might be followed by a calling convention  }
+  function LocalSkipDeclaration: Boolean;
+  var
+    EndLevel, PLevel: Integer;
+    IsSemicolon: Boolean;
+    WhitespaceCollectorToAdd: string;
+  begin
+    EndLevel := 0;
+    PLevel := 0;
+    Result := False;
+    repeat
+      t := GetNextToken(Constant);
+      WhitespaceCollectorToAdd := '';
+      try
+        case t.MyType of
+          TOK_SYMBOL:
+            case t.Info.SymbolType of
+              SYM_LEFT_PARENTHESIS: Inc(PLevel);
+              SYM_RIGHT_PARENTHESIS: Dec(PLevel);
+            end;
+          TOK_KEYWORD:
+            case t.Info.KeyWord of
+              KEY_END: Dec(EndLevel);
+              KEY_RECORD: Inc(EndLevel);
+              KEY_LIBRARY:
+                Constant.HintDirectives := Constant.HintDirectives + [hdLibrary];
+              KEY_FUNCTION,
+              KEY_PROCEDURE:
+                Result := True;
+          end;
+        TOK_IDENTIFIER:
+          case t.Info.StandardDirective of
+            SD_PLATFORM:
+              Constant.HintDirectives := Constant.HintDirectives + [hdPlatform];
+            SD_EXPERIMENTAL:
+              Constant.HintDirectives := Constant.HintDirectives + [hdExperimental];
+            SD_UNIMPLEMENTED:
+              Constant.HintDirectives := Constant.HintDirectives + [hdUnimplemented];
+            SD_DEPRECATED:
+              begin
+                Constant.HintDirectives := Constant.HintDirectives + [hdDeprecated];
+                while PeekNextToken(WhitespaceCollectorToAdd).MyType = TOK_STRING do
+                begin
+                  { consume the following string as DeprecatedNote }
+                  Constant.FullDeclaration := Constant.FullDeclaration + t.Data + WhitespaceCollectorToAdd;
+                  FreeAndNil(t);
+                  t := GetNextToken(Constant);
+                  Assert(T.MyType = TOK_STRING); // T is now the same thing we saw with PeekNextToken
+                  Constant.DeprecatedNote := Constant.DeprecatedNote + t.StringContent;
+                end;
+                { otherwise WhitespaceCollectorToAdd will be added later }
+              end;
+          end;
+        end;
+        IsSemicolon := t.IsSymbol(SYM_SEMICOLON);
+
+        { Reason for "EndLevel < 0" condition:
+            Within records et al. the last declaration need not be terminated by ;
+          Reason for "(PLevel < 0) and IsInRecordCase" condition:
+            See autodoc of SkipDeclaration in TParser interface. }
+        if (EndLevel < 0) {or
+          ( (PLevel < 0) and IsInRecordCase )} then
+        begin
+          Scanner.UnGetToken(t);
+          Exit;
+        end;
+        Constant.FullDeclaration := Constant.FullDeclaration + t.Data + WhitespaceCollectorToAdd;
+        t.Free;
+      except
+        t.Free;
+        raise;
+      end;
+    until IsSemicolon and (EndLevel = 0) and (PLevel = 0);
+  end;
+
+begin
+  Constant := TPasConstant.Create;
+
+  try
+    Constant.Name := GetAndCheckNextToken(TOK_IDENTIFIER);
+    Constant.SourceAbsoluteFileName := FLastParsedTokenStreamAbsoluteFileName;
+    Constant.SourceLine := FLastParsedTokenLine;
+    Constant.SourceRootLine := FLastParsedTokenRootLine;
+    DoMessage(5, pmtInformation, 'Parsing constant %s', [Constant.Name]);
+    Constant.RawDescriptionInfo^ := GetLastComment;
+    Constant.FullDeclaration := Constant.Name;
+    Constant.SetAttributes(CurrentAttributes);
+
+    if LocalSkipDeclaration then
+    begin
+      { Check for following calling conventions }
+      t := GetNextToken(WhitespaceCollector);
+      try
+        case t.Info.StandardDirective of
+          SD_CDECL, SD_STDCALL, SD_WINAPI, SD_PASCAL, SD_REGISTER, SD_SAFECALL:
+            begin
+              Constant.FullDeclaration := Constant.FullDeclaration + WhitespaceCollector;
+              Constant.FullDeclaration := Constant.FullDeclaration + t.Data;
+              FreeAndNil(t);
+              SkipDeclaration(Constant, false);
+            end;
+        else
+          Scanner.UnGetToken(t);
+        end;
+      except
+        t.Free;
+        raise;
+      end;
+    end;
+
+    Scanner.DeclareIdentifier(Constant.Name);
+    if Pos('=',Constant.FullDeclaration)>0 then
+      Scanner.DeclareIdentifier(Constant.Name,Trim(Copy(Constant.FullDeclaration,Pos('=',Constant.FullDeclaration)+1,Length(Constant.FullDeclaration)-Pos('=',Constant.FullDeclaration)-1)));
+    ItemsForNextBackComment.ClearAndAdd(Constant);
+  except
+    FreeAndNil(Constant);
+    raise;
+  end;
+end;
+
+{ ---------------------------------------------------------------------------- }
+
+procedure TParser.ParseEnum(out p: TPasEnum;
+  const Name: string; const RawDescriptionInfo: TRawDescriptionInfo);
+var
+  T: TToken;
+  Item: TPasItem;
+  ParenLevel: Integer;
+begin
+  t := nil;
+  p := TPasEnum.Create;
+  try
+    p.Name := Name;
+    p.Scoped := Scanner.OptionIs('SCOPEDENUMS','ON');
+    p.RawDescriptionInfo^ := RawDescriptionInfo;
+    p.FullDeclaration := Name + ' = (...)';
+    p.SetAttributes(CurrentAttributes);
+    ItemsForNextBackComment.ClearAndAdd(P);
+
+    T := GetNextToken;
+    while not T.IsSymbol(SYM_RIGHT_PARENTHESIS) do
+    begin
+      CheckToken(T, TOK_IDENTIFIER);
+      Item := TPasItem.Create;
+      Item.Name := T.Data;
+      Item.SourceAbsoluteFileName := T.StreamAbsoluteFileName;
+      Item.SourceLine := T.Line;
+      Item.SourceRootLine := T.RootLine;
+      Item.RawDescriptionInfo^ := GetLastComment;
+      Item.FullDeclaration := Item.Name;
+      p.Members.Add(Item);
+      ItemsForNextBackComment.ClearAndAdd(Item);
+      FreeAndNil(T);
+
+      T := GetNextToken;
+      if T.IsSymbol(SYM_EQUAL) or T.IsSymbol(SYM_ASSIGN) then
+      begin
+        Item.FullDeclaration := Item.FullDeclaration + ' ' + T.Data + ' ';
+        FreeAndNil(T);
+
+        { Now read tokens until comma or right paren (but only on ParenLevel = 0). }
+        ParenLevel := 0;
+        repeat
+          T := GetNextToken;
+
+          if (ParenLevel = 0) and
+             (T.IsSymbol(SYM_COMMA) or T.IsSymbol(SYM_RIGHT_PARENTHESIS)) then
+            Break;
+
+          if T.MyType = TOK_SYMBOL then
+            case T.Info.SymbolType of
+              SYM_LEFT_PARENTHESIS, SYM_LEFT_BRACKET: Inc(ParenLevel);
+              SYM_RIGHT_PARENTHESIS, SYM_RIGHT_BRACKET: Dec(ParenLevel);
+            end;
+
+          Item.FullDeclaration := Item.FullDeclaration + T.Data;
+          FreeAndNil(T);
+        until false;
+      end;
+
+      if T.IsSymbol(SYM_COMMA) then
+      begin
+        FreeAndNil(T);
+        T := GetNextToken;
+      end;
+    end;
+    P.SourceEndLine := T.Line;
+    FreeAndNil(T);
+
+    { Read semicolon, as an optional token.
+      Actually, the stricter rule would be
+      - if some hint directive ("deprecated" or such) follows,
+        then semicolon here is prohibited.
+      - otherwise, semicolon here is required. }
+    T := PeekNextToken;
+    if T.IsSymbol(SYM_SEMICOLON) then
+    begin
+      P.FullDeclaration := P.FullDeclaration + ';';
+      Scanner.ConsumeToken;
+      FreeAndNil(T);
+    end;
+
+    ParseHintDirectives(P, true, true);
+  except
+    p.Free;
+    T.Free;
+    raise;
+  end;
+end;
+
+procedure TParser.ParseStrongTypeAlias(out P: TPasAliasType; const Name: string;
+  const RawDescriptionInfo: TRawDescriptionInfo);
+var
+  T: TToken;
+begin
+  P := TPasAliasType.Create;
+  T := nil;
+  try
+    P.Name := Name;
+    P.RawDescriptionInfo^ := RawDescriptionInfo;
+    P.SetAttributes(CurrentAttributes);
+    P.IsStrongAlias := true;
+
+    { With Delphi, this is always a simple known type name,
+      our type or built-in type like "TSomething = type string;".
+      So ParseKnownTypeIdentifier should handle everything.
+      With FPC, it can be more compicated, subranges (of numbers or enums)
+      are also allowed, which will need to iterate "all until ;" to get everything. }
+    T := PeekNextToken;
+    if T.IsKeyWord(KEY_STRING) or (T.MyType = TOK_IDENTIFIER) then
+      P.AliasedName := ParseKnownTypeIdentifier;
+
+    { Parse until ;
+      This handles type definitions with more tokens,
+      like subrange "UCS4Char = type 0..$10fff". }
+    repeat
+      T := GetNextToken;
+      try
+        if T.IsSymbol(SYM_SEMICOLON) then
+          Break
+        else
+          P.AliasedName := P.AliasedName + T.Data;
+      finally
+        FreeAndNil(T);
+      end;
+    until False;
+
+    P.FullDeclaration := Name + ' = type ' + P.AliasedName + ';';
+
+    ParseHintDirectives(P, true, true);
+  except
+    P.Free;
+    T.Free;
+    raise;
+  end;
+end;
+
+procedure TParser.ParseTVCSection(U: TPasUnit);
+var
+  Section: TParsingSection;
+  t, t2: TToken;
+  ConstantParsed: TPasConstant;
+begin
+  Section := psNone;
+
+  repeat
+    t := GetNextToken;
+    try
+      case t.MyType of
+        TOK_IDENTIFIER:
+          begin
+            if t.Info.StandardDirective = SD_OPERATOR then
+            begin
+              Scanner.UnGetToken(t);
+              Break;
+            end;
+
+            case Section of
+              psConst:
+                begin
+                  Scanner.UnGetToken(t);
+                  ParseConstant(ConstantParsed);
+                  ConstantParsed.MyUnit := U;
+                  if U <> nil then
+                    U.AddConstant(ConstantParsed)
+                  else
+                    FreeAndNil(ConstantParsed);
+                end;
+              psType:
+                begin
+                  { "generic" directive may mean either
+                    - generic type or
+                    - generic function/procedure, so we need to look one token ahead.
+                    For generic type, call ParseType.
+                    for generic function/procedure, break -> thus ending
+                    ParseTVCSection, because we are no longer in var/const/type section. }
+                  if t.IsStandardDirective(SD_GENERIC) then
+                  begin
+                    t2 := PeekNextToken;
+                    if t2.IsKeyWord(KEY_FUNCTION) or t2.IsKeyWord(KEY_PROCEDURE) then
+                      Break
+                    else
+                    begin
+                      Scanner.UnGetToken(t); // put "generic" back, ParseType will consume it
+                      ParseType(U);
+                    end;
+                  end
+                  else
+                  begin
+                    Scanner.UnGetToken(t); // put initial identifier back, ParseType will consume it
+                    ParseType(U)
+                  end;
+                  AttributeIsPossible := True;
+                end;
+              psVar:
+                begin
+                  Scanner.UnGetToken(t);
+                  ParseVariables(U);
+                end;
+              else
+                DoError('Unexpected %s', [t.Description]);
+            end;
+          end;
+        TOK_KEYWORD:
+          begin
+            // Back comments after a keyword are senseless
+            ItemsForNextBackComment.Clear;
+            case t.Info.KeyWord of
+              KEY_RESOURCESTRING, KEY_CONST:
+                Section := psConst;
+              KEY_THREADVAR, KEY_VAR:
+                Section := psVar;
+              KEY_TYPE:
+                begin
+                  Section := psType;
+                  AttributeIsPossible := True;
+                end;
+              else
+                begin
+                  Scanner.UnGetToken(t);
+                  Break;
+                end;
+            end;
+          end;
+      end;
+    finally
+      FreeAndNil(t);
+    end;
+  until False;
+end;
+
+procedure TParser.ParseInterfaceSection(const U: TPasUnit);
+var
+  M: TPasRoutine;
+  t, t2: TToken;
+  PropertyParsed: TPasProperty;
+begin
+  DoMessage(4, pmtInformation, 'Entering interface section of unit %s',[U.Name]);
+
+  AttributeIsPossible := False;
+
+  repeat
+    t := GetNextToken;
+
+    try
+      case t.MyType of
+        TOK_IDENTIFIER:
+          if t.Info.StandardDirective = SD_OPERATOR then
+          begin
+            ParseRoutine(M, '', t.Data, ROUTINE_OPERATOR,
+              GetLastComment, true, true, '');
+            U.FuncsProcs.Add(M);
+          end
+          //Generics functions and procedures
+          else if t.IsStandardDirective(SD_GENERIC) then
+          begin
+            //Skip generics directive because delphi do not have and we can't return two tokens
+            t2 := PeekNextToken();
+            if t2.IsKeyWord(KEY_FUNCTION) or t2.IsKeyWord(KEY_PROCEDURE) then
+            begin
+              t := GetNextToken;
+              try
+                ParseRoutine(M, '', t.Data, KeyWordToRoutineType(t.Info.KeyWord),
+                  GetLastComment, true, true, '');
+                U.FuncsProcs.Add(M)
+              finally
+                FreeAndNil(t)
+              end;
+            end
+            else
+              DoError('Unexpected %s', [t2.Description]);
+          end
+          else
+            DoError('Unexpected %s', [t.Description]);
+        TOK_KEYWORD:
+          begin
+            case t.Info.KeyWord of
+              KEY_RESOURCESTRING, KEY_CONST,
+              KEY_TYPE,
+              KEY_THREADVAR, KEY_VAR:
+                begin
+                  Scanner.UnGetToken(t);
+                  ParseTVCSection(U);
+                end;
+              KEY_EXPORTS:
+                begin
+                  // Skip until semicolon
+                  repeat
+                    T := GetNextToken;
+                    try
+                      if T.IsSymbol(SYM_SEMICOLON) then
+                        Break;
+                    finally
+                      FreeAndNil(T);
+                    end;
+                  until False;
+                end;
+              KEY_FUNCTION, KEY_PROCEDURE:
+                begin
+                  ParseRoutine(M, '', t.Data, KeyWordToRoutineType(t.Info.KeyWord),
+                    GetLastComment, true, true, '');
+                  U.FuncsProcs.Add(M);
+                end;
+              KEY_IMPLEMENTATION:
+                begin
+                  Scanner.UnGetToken(t);
+                  Break;
+                end;
+              KEY_USES:
+                ParseUses(U);
+              KEY_PROPERTY:
+                begin
+                  ParseProperty(PropertyParsed);
+                  U.Variables.Add(PropertyParsed);
+                end;
+            else
+              DoError('Unexpected %s', [t.Description]);
+            end;
+          end;
+      end;
+    finally
+      FreeAndNil(t);
+    end;
+  until False;
+end;
+
+{ Return string value calculated from old and new values according to merge method }
+function MergeStringValues(const MergeType: TInfoMergeType;
+  const OldValue, NewValue: string): string;
+begin
+  case MergeType of
+    imtNone:
+      Result := OldValue;
+    imtPreferIntf:
+      Result := IfThen(OldValue <> '', OldValue, NewValue);
+    imtPreferImpl:
+      Result := IfThen(NewValue <> '', NewValue, OldValue);
+    // Also process case when OldValue is fully contained in NewValue.
+    // This allows specifying short abstract in intf section and full description
+    // in impl section.
+    // At this stage values are raw, that is, could contain multiple whitespaces.
+    // We must exclude whitespaces from check.
+    imtJoin:
+      // Note: this could be optimized to not use 2nd Trim or even check in-place without
+      // creation of new string variables.
+      if (Trim(OldValue) <> '') and not AnsiStartsStr(Trim(OldValue), Trim(NewValue)) then
+        Result := OldValue + LineEnding + NewValue
+      else
+        Result := NewValue;
+    else raise EInternalParserError.Create('TInfoMergeType unimplemented');
+  end;
+end;
+
+{ Merge metadata of Source and Dest routines.
+  At the stage of parsing impl section these items only have RawDescriptionInfo
+  so that's the only data we've to merge.
+
+  NB: this merge is only correct if routines haven't been processed yet so
+  there's no sense in moving it to common util unit or TPasRoutine members. }
+procedure MergeRoutineData(const MergeType: TInfoMergeType;
+  const Dest: TPasRoutine; const SourceData: TRawDescriptionInfo);
+begin
+  Dest.RawDescriptionInfo^.Content :=
+    MergeStringValues(MergeType, Dest.RawDescriptionInfo^.Content, SourceData.Content);
+end;
+
+procedure TParser.ParseImplementationSection(const U: TPasUnit);
+type
+  { Map method name -> count. }
+  TMethodCountsDictionary = {$ifdef FPC}specialize{$endif} TDictionary<String, Integer>;
+
+var
+  // Collector of all ignored items that won't go to `U`
+  DummyUnit: TPasUnit;
+
+  // Clear all comment data that was accumulated by PeekNextToken
+  procedure ClearComments;
+  begin
+    IsLastComment := False;
+    LastCommentWasCStyle := False;
+    LastCommentHelpInsight := False;
+    LastCommentInfo := EmptyRawDescriptionInfo;
+  end;
+
+  { Function to skip header (parameters declarations) of anon method aka lambda.
+    Just read until "begin" }
+  procedure SkipLambdaHeader;
+  var t: TToken;
+  begin
+    t := nil;
+    repeat
+      t := PeekNextToken;
+      if t.IsKeyWord(KEY_BEGIN) then
+        Break;
+
+      Scanner.ConsumeToken;
+      FreeAndNil(t);
+    until False;
+  end;
+
+  { Here we stand:
+      - at the beginning of a routine's (function/procedure/constructor/destructor)
+        valuable (non-comment) inner contents (after ParseRoutine invokation)
+      or
+      - right after function/procedure keyword (lambda assignment/declaration; parameters
+        or comment or contents following)
+    Skip everything until "end;" }
+  procedure SkipMethodBody(IsLambda: Boolean = False);
+  var
+    t: TToken;
+    EndLevel: Integer;
+    InsideMethodBody, AsmBlock: Boolean;
+    M: TPasRoutine;
+  begin
+    EndLevel := 0; InsideMethodBody := False; AsmBlock := False; t := nil;
+    repeat
+      if t = nil then
+        t := GetNextToken;
+
+      // Check only keywords; skip all keywords inside ASM blocks except "end"
+      if (t.MyType = TOK_KEYWORD) and (not AsmBlock or (t.Info.KeyWord = KEY_END)) then
+        case t.Info.KeyWord of
+          // nested const/type section
+          // KEY_RESOURCESTRING and KEY_THREADVAR are not allowed here but let them remain
+          KEY_RESOURCESTRING, KEY_CONST,
+          KEY_TYPE,
+          KEY_THREADVAR:
+            begin
+              Scanner.UnGetToken(t);
+              ParseTVCSection(DummyUnit); // ignore section contents
+            end;
+          // nested var section or inline var
+          KEY_VAR:
+            if not InsideMethodBody then
+            begin
+              // special case to handle typeless inline var declaration:
+              // "begin ... var foo := 1; ... end;" - just skip if the clause is inside a method body
+              Scanner.UnGetToken(t);
+              ParseTVCSection(DummyUnit); // ignore section contents
+            end;
+          // If we encounter BEGIN or ASM - check that current nesting level is 0,
+          // this means we've started the entrypoint of this method
+          KEY_BEGIN, KEY_ASM:
+            begin
+              if EndLevel = 0 then
+                InsideMethodBody := True;
+              // Asm blocks have different syntax that allows any Pascal keyword, even "end"
+              // so handle them specially
+              AsmBlock := (t.Info.KeyWord = KEY_ASM);
+              Inc(EndLevel);
+            end;
+          // Other constructions in the code section that must end with END keyword
+          KEY_CASE, KEY_TRY:
+            Inc(EndLevel);
+          // Nested subroutine / lambda. Run the skip recursively.
+          KEY_PROCEDURE, KEY_FUNCTION:
+            begin
+              // if InsideMethodBody - it's a lambda without name
+              // otherwise it's a nested subroutine that requires name
+              if not InsideMethodBody then
+              begin
+                ParseRoutine(M, '', '', KeyWordToRoutineType(t.Info.KeyWord), GetLastComment, True, False, '');
+                FreeAndNil(M);
+              end
+              else
+                SkipLambdaHeader;
+              // There could not be external methods inside a method so skip body unconditionally
+              SkipMethodBody(InsideMethodBody);
+            end;
+          KEY_END:
+            begin
+              // ASM blocks can contain labels or identifiers named "end" so check
+              // whether the "end" is followed by ";". Skip if not
+              if AsmBlock then
+              begin
+                if not PeekNextToken.IsSymbol(SYM_SEMICOLON) then
+                begin
+                  FreeAndNil(t);
+                  t := GetNextToken;
+                  Continue;
+                end;
+              end;
+              AsmBlock := False;
+              Dec(EndLevel);
+              if InsideMethodBody and (EndLevel = 0) then
+              begin
+                // for subroutines ";" after "end" is obligatory
+                if not IsLambda then
+                  GetAndCheckNextToken(SYM_SEMICOLON)
+                // lambdas could end with
+                //   ";" (var assignment),
+                //   ")" (as parameter in method),
+                //   "," (as one of parameters in method, item of array etc),
+                //   "]" (last item in array)
+                // ...
+                else
+                  try
+                    FreeAndNil(t);
+                    t := GetNextToken;
+                    if not ((t.MyType = TOK_SYMBOL) and
+                      (t.Info.SymbolType in [SYM_SEMICOLON, SYM_COMMA,
+                        SYM_RIGHT_PARENTHESIS, SYM_RIGHT_BRACKET])) then
+                      DoError(SExpectedButFound,
+                        ['one of ";", ")", ",", "]" symbols', T.Description]);
+                  finally
+                    FreeAndNil(t);
+                  end;
+                Break;
+              end;
+            end;
+        end;
+      FreeAndNil(t);
+    until False;
+    FreeAndNil(t);
+    // Empty all comments accumulated inside method body by PeekNextToken
+    // Otherwise they will go to a next item
+    ClearComments;
+  end;
+
+  { Search for method object added by parsing intf section.
+    Method could be standalone routine, FPC operator or CIO member.
+    In the latter case it will have fully specified name (TClass.TNestedClass.Proc).
+    Corresponding method likely could not exist in lists from intf section because
+    of ignoring or visibility settings.
+      @param U - unit to search in
+      @param MethodName - full method name to search for
+      @param Index - 0-based index of a method overload to search for. Currently
+        method lists could contain multiple entries with identical names because
+        of overload feature. Specifying Index allows to search for a concrete item.
+        Of course this will work correctly only if methods were declared in the
+        same order as they appear in impl section }
+  function FindExistingRoutine(U: TPasUnit; const MethodName: string; Index: Integer; Prototype: TPasRoutine): TPasRoutine;
+  var
+    NameParts: TNameParts;
+    i: Integer;
+    item: TBaseItem;
+    Routines: TPasItems;
+    ShortName: string;
+    OnlyCandidate: TPasRoutine;
+    Candidates: Integer;
+  begin
+    Result := nil;
+    Routines:=nil; ShortName:=MethodName;
+    // Check if we got a standalone routine or a class/record method
+    // NB: method could be FPC operator with symbolic name so just check for dot inside
+    if Pos('.', MethodName) = 0 then
+    begin
+      Routines:=U.FuncsProcs;
+    end
+    else
+    begin
+      if not SplitNameParts(MethodName, NameParts) then
+        DoError('Method name %s is invalid', [MethodName]);
+      // Search for method owner
+      item := U.CIOs.FindListItem(NameParts[0]);
+      // Also in nested classes
+      if item <> nil then
+        for i := Low(NameParts) + 1 to High(NameParts) - 1 do
+        begin
+          item := (item as TPasCio).CIOs.FindListItem(NameParts[i]);
+          if item = nil then
+            Break;
+        end;
+      if item <> nil then Routines:=(item as TPasCio).Methods;
+      ShortName:=NameParts[High(NameParts)];
+    end;
+    // Implementation order can differ from interface overload order. A forward
+    // declaration and its definition are one routine, not two overloads.
+    if Routines<>nil then
+      for item in Routines do
+        if SameText(item.Name,ShortName) and
+          SameText(TPasRoutine(item).ParamTypes.Text,Prototype.ParamTypes.Text) then
+        begin Result:=TPasRoutine(item); Break; end;
+    // Imported type aliases can spell the same parameter differently, e.g.
+    // Cardinal in the interface and Windows.COLORREF in the implementation.
+    // A unique same-name declaration is the only possible owner in valid Delphi.
+    if (Result=nil) and (Routines<>nil) then
+    begin
+      Candidates:=0; OnlyCandidate:=nil;
+      for item in Routines do if SameText(item.Name,ShortName) then
+      begin Inc(Candidates); OnlyCandidate:=TPasRoutine(item); end;
+      if (Candidates=1) and (OnlyCandidate.ParamTypes.Count=Prototype.ParamTypes.Count) then Result:=OnlyCandidate;
+    end;
+    // print message for debug purposes
+    if Result = nil then
+      DoMessage(5, pmtInformation, 'No definition of %d-th method "%s" found - probably internal or ignored', [Index, MethodName])
+  end;
+
+  { Read routine header and merge its description with existing item. }
+  procedure HandleRoutine(U: TPasUnit; RoutineType: TRoutineType;
+    IsGeneric: String;
+    const MethodCounts: TMethodCountsDictionary = nil;
+    const ClassKeyWordString: string = '');
+  var
+    M, ExistingRoutine: TPasRoutine;
+    Count: Integer;
+  begin
+    ParseRoutine(M, ClassKeyWordString, RoutineTypeToString(RoutineType), RoutineType,
+      GetLastComment, True, True, IsGeneric);
+    // ParseRoutine was called with InitItemsForNextBackComment so it added M to
+    // ItemsForNextBackComment list. We must clear it so that following comments
+    // in AutoBackComments mode won't glue to method object which is already disposed
+    ItemsForNextBackComment.Clear;
+
+    // If a method counter is given, search for method inside it. Otherwise
+    // assume Count is 1.
+    if MethodCounts <> nil then
+    begin
+      if not MethodCounts.TryGetValue(M.Name, Count) then
+        Count := 0;
+      Inc(Count);
+      MethodCounts.AddOrSetValue(M.Name, Count);
+    end else
+      Count := 1;
+
+    ExistingRoutine := FindExistingRoutine(U, M.Name, Count - 1,M);
+    if FKeepImplementation and (ExistingRoutine=nil) and (Pos('.',M.Name)=0) then
+    begin
+      ExistingRoutine:=M; U.FuncsProcs.Add(M);
+      ExistingRoutine.MyUnit:=U; ExistingRoutine.Visibility:=viPrivate;
+    end;
+    // NB: Currently we don't add methods not declared in intf section
+    if ExistingRoutine <> nil then
+      MergeRoutineData(FInfoMergeType, ExistingRoutine, M.RawDescriptionInfo^);
+    // External and forward methods have no body
+    if [SD_FORWARD, SD_EXTERNAL]*M.Directives = [] then
+    begin
+      if FKeepImplementation then FBodyRoutine:=ExistingRoutine;
+      FTodoRoutine:=ExistingRoutine;
+      try SkipMethodBody;
+      finally FBodyRoutine:=nil; FTodoRoutine:=nil; end;
+      DoMessage(5, pmtInformation, 'Skipped body of %s "%s"',
+        [RoutineTypeToString(RoutineType), M.Name]);
+    end;
+    if M<>ExistingRoutine then FreeAndNil(M);
+  end;
+
+var
+  t, t2: TToken;
+  PropertyParsed: TPasProperty;
+  MethodCounts: TMethodCountsDictionary;
+begin
+  { Parsing impl section clears the comment otherwise comment before "implementation"
+    keyword would descend to first item of impl section }
+  ClearComments;
+
+  if FInfoMergeType = imtNone then Exit;
+
+  DoMessage(4, pmtInformation, 'Entering implementation section of unit %s',[U.Name]);
+
+  AttributeIsPossible := False;
+  MethodCounts := TMethodCountsDictionary.Create;
+  { We can't immediately dispose parsed items because we've got to handle back
+    comments. So we create dummy container that will gather all ignored items. }
+  DummyUnit := TPasUnit.Create;
+
+  try
+    repeat
+      t := GetNextToken;
+      try
+        case t.MyType of
+          TOK_IDENTIFIER:
+            if t.Info.StandardDirective = SD_OPERATOR then
+            begin
+              HandleRoutine(U, ROUTINE_OPERATOR, '');
+            end
+            else if t.IsStandardDirective(SD_GENERIC) then
+            begin
+              t2 := PeekNextToken;
+              if t2.Info.KeyWord in [KEY_FUNCTION, KEY_PROCEDURE] then
+              begin
+                 t2 := GetNextToken;
+                 try
+                   HandleRoutine(U, KeyWordToRoutineType(t2.Info.KeyWord), t.Data, MethodCounts)
+                 finally
+                   FreeAndNil(t2)
+                 end
+              end
+              else
+                 DoError('Unexpected %s', [t2.Description])
+            end
+            else
+              DoError('Unexpected %s', [t.Description]);
+
+          TOK_KEYWORD:
+            begin
+              case t.Info.KeyWord of
+                KEY_RESOURCESTRING, KEY_CONST,
+                KEY_TYPE,
+                KEY_THREADVAR, KEY_VAR:
+                  begin
+                    Scanner.UnGetToken(t);
+                    if FKeepImplementation then ParseTVCSection(U)
+                    else ParseTVCSection(DummyUnit);
+                  end;
+                KEY_CLASS, KEY_OBJCCLASS:
+                  //ClassKeyWordString := t.Data; // not needed after all
+                  ;
+                KEY_FUNCTION, KEY_PROCEDURE, KEY_CONSTRUCTOR, KEY_DESTRUCTOR:
+                  begin
+                    HandleRoutine(U, KeyWordToRoutineType(t.Info.KeyWord), '', MethodCounts);
+                  end;
+                // Do not read unit used internally for now - maybe will do in the future
+                KEY_USES:
+                  if FKeepImplementation then ParseUses(U) else ParseUses(nil);
+                KEY_PROPERTY:
+                  begin
+                    ParseProperty(PropertyParsed);
+                    FreeAndNil(PropertyParsed);
+                  end;
+                { Stop parsing on "initialization", "finalization".
+                  The "begin" at this point is equivalent to "initialization". }
+                KEY_BEGIN, KEY_INITIALIZATION, KEY_FINALIZATION:
+                  Break;
+                // Stop parsing on "end.". Must come here only on final "end" so
+                // don't care about other cases
+                KEY_END:
+                  begin
+                    // skip possible whitespaces
+                    repeat
+                      FreeAndNil(t);
+                      t := GetNextToken;
+                    until not (t.MyType = TOK_WHITESPACE);
+                    // token must be period
+                    if t.IsSymbol(SYM_PERIOD) then
+                      Break;
+                    DoError('Unexpected %s', [t.Description]);
+                  end;
+              else
+                DoError('Unexpected %s', [t.Description]);
+              end;
+            end;
+        end;
+      finally
+        FreeAndNil(t);
+      end;
+    until False;
+  finally
+    FreeAndNil(MethodCounts);
+    FreeAndNil(DummyUnit);
+  end;
+end;
+
+{ ---------------------------------------------------------------------------- }
+
+procedure TParser.ParseProperty(out p: TPasProperty);
+
+  { Parse property information
+      read XXX
+      write XXX
+      default XXX
+      nodefault
+      stored XXX
+
+    Stops on semicolon.
+
+    Also all whitespace and tokens are added to P.FullDeclaration.
+  }
+  procedure ParsePropertyEnding(const P: TPasProperty);
+  var
+    HasCurrentDirective: Boolean;
+    CurrentDirective: TStandardDirective;
+    CurrentDirectiveCollected: String;
+
+    procedure CurrentDirectiveFinished;
+    begin
+      if HasCurrentDirective then
+      begin
+        case CurrentDirective of
+          SD_READ: P.Reader := CurrentDirectiveCollected;
+          SD_WRITE: P.Writer := CurrentDirectiveCollected;
+          SD_DEFAULT: P.DefaultValue := CurrentDirectiveCollected;
+          SD_STORED: P.Stored := CurrentDirectiveCollected;
+          else raise EInternalParserError.Create('CurrentDirectiveFinished: unexpected CurrentDirective');
+        end;
+        HasCurrentDirective := false;
+      end;
+    end;
+
+  var
+    T: TToken;
+    PreviousWasDot: Boolean;
+  begin
+    { HasCurrentDirective, CurrentDirective track are we now collecting
+      tokens that follow a directive like SD_READ, SD_WRITE.
+      We are prepared that each directive may be followed by a series of tokens,
+      which allows to parse e.g. "default TXxx.Yyy" or "default 10 + 20". }
+    HasCurrentDirective := false;
+
+    { We track if previous token is dot, to not treat 2nd "default" as start
+      of default section in code like this: "property Xxx default TSomething.Default". }
+    PreviousWasDot := false;
+
+    repeat
+      T := GetNextToken(P);
+
+      { regardless of the whole logic of capturing current directive (like read, write),
+        we have to add all whitespace and tokens to P.FullDeclaration. }
+      P.FullDeclaration := P.FullDeclaration + T.Data;
+
+      if T.IsStandardDirective(SD_NODEFAULT) then
+      begin
+        T.Free;
+        CurrentDirectiveFinished;
+        PreviousWasDot := false;
+        P.NoDefault := true;
+      end else
+      if (T.MyType = TOK_IDENTIFIER) and
+         (not PreviousWasDot) and
+         (T.Info.StandardDirective in [SD_READ, SD_WRITE, SD_DEFAULT, SD_STORED]) then
+      begin
+        CurrentDirectiveFinished;
+        PreviousWasDot := false;
+        { initialize tracking new CurrentDirective }
+        HasCurrentDirective := true;
+        CurrentDirective := T.Info.StandardDirective;
+        CurrentDirectiveCollected := '';
+        T.Free;
+      end else
+      if T.IsSymbol(SYM_SEMICOLON) then
+      begin
+        T.Free;
+        CurrentDirectiveFinished;
+        // PreviousWasDot := false; // PreviousWasDot value doesn't matter further in this case
+        Break;
+      end else
+      begin
+        if HasCurrentDirective then
+          CurrentDirectiveCollected := SAppendPart(CurrentDirectiveCollected, ' ', T.Data);
+        PreviousWasDot := T.IsSymbol(SYM_PERIOD);
+        T.Free;
+      end;
+    until false; // always exits with Break
+  end;
+
+var
+  Finished: Boolean;
+  t: TToken;
+begin
+  t := nil;
+  p := TPasProperty.Create;
+  try
+    p.Name := GetAndCheckNextToken(TOK_IDENTIFIER);
+    p.SourceAbsoluteFileName := FLastParsedTokenStreamAbsoluteFileName;
+    p.SourceLine := FLastParsedTokenLine;
+    p.SourceRootLine := FLastParsedTokenRootLine;
+    DoMessage(5, pmtInformation, 'Parsing property %s', [p.Name]);
+    p.IndexDecl := '';
+    p.Proptype := '';
+    p.FullDeclaration := 'property ' + p.Name;
+    p.RawDescriptionInfo^ := GetLastComment;
+    p.SetAttributes(CurrentAttributes);
+    ItemsForNextBackComment.ClearAndAdd(P);
+
+    { Is this only a redeclaration of property from ancestor
+      (to e.g. change it's visibility, or add a hint directive) }
+    t := GetNextToken(P);
+    if t.IsSymbol(SYM_SEMICOLON) then
+    begin
+      p.FullDeclaration := p.FullDeclaration + ';';
+      FreeAndNil(t);
+      ParseHintDirectives(P, true, true);
+      Exit;
+    end;
+
+    { get index }
+    if t.IsSymbol(SYM_LEFT_BRACKET) then
+    begin
+      FreeAndNil(t);
+      p.IndexDecl := '[';
+      p.FullDeclaration := p.FullDeclaration + '[';
+      repeat
+        t := GetNextToken;
+
+        if not (t.MyType in TokenCommentTypes + [TOK_DIRECTIVE]) then
+        begin
+          p.IndexDecl := p.IndexDecl + t.Data;
+          p.FullDeclaration := AppendDeclaration(p.FullDeclaration, t.Data);
+        end;
+        Finished := t.IsSymbol(SYM_RIGHT_BRACKET);
+        FreeAndNil(t);
+      until Finished;
+
+      t := GetNextToken;
+    end;
+
+    { now if there is a colon, it is followed by the type }
+    if t.IsSymbol(SYM_COLON) then
+    begin
+      FreeAndNil(t);
+
+      { get property type }
+      t := GetNextToken;
+      if (t.MyType <> TOK_IDENTIFIER) and (t.MyType <> TOK_KEYWORD) then
+        DoError('Identifier or keyword expected but %s found', [T.Description]);
+
+      p.Proptype := t.Data;
+      FreeAndNil(t);
+      p.FullDeclaration := p.FullDeclaration + ': ' + p.Proptype;
+    end else
+    begin
+      p.FullDeclaration := p.FullDeclaration + t.Data;
+      FreeAndNil(t);
+    end;
+
+    ParsePropertyEnding(P);
+
+    { Handle "default;" directive for default array properties.
+      This is separate from "default <value>" (handled inside ParsePropertyEnding)
+      and appears after the semicolon, e.g.:
+        property Items[Index: Integer]: Byte read GetItems write SetItems; default;
+    }
+    t := PeekNextToken;
+    if t.IsStandardDirective(SD_DEFAULT) then
+    begin
+      t := GetNextToken(P);
+      P.FullDeclaration := P.FullDeclaration + ' ' + t.Data;
+      FreeAndNil(t);
+      P.DefaultInClass := true;
+      t := GetNextToken(P);
+      if t.IsSymbol(SYM_SEMICOLON) then
+        P.FullDeclaration := P.FullDeclaration + t.Data;
+      FreeAndNil(t);
+    end;
+
+    ParseHintDirectives(P, true, true);
+  except
+    p.Free;
+    t.Free;
+    raise
+  end;
+end;
+
+{ ---------------------------------------------------------------------------- }
+
+procedure TParser.ParseRecordCase(const R: TPasCio;
+  const SubCase: boolean);
+var
+  t: TToken;
+  LNeedId: boolean;
+  P: TPasFieldVariable;
+  OldAttribPossible: Boolean;
+begin
+  t := GetNextToken;
+  try
+    CheckToken(t, TOK_IDENTIFIER);
+
+    if PeekNextToken.IsSymbol(SYM_COLON) then
+    begin
+      { Then we have "case FieldName: FieldType of" }
+
+      { consume and free the colon token }
+      GetNextToken.Free;
+
+      P := TPasFieldVariable.Create;
+      p.Name := t.Data;
+      p.SourceAbsoluteFileName := t.StreamAbsoluteFileName;
+      p.SourceLine := t.Line;
+      p.SourceRootLine := t.RootLine;
+      p.RawDescriptionInfo^ := GetLastComment;
+      p.FullDeclaration := p.Name + ': ' + GetAndCheckNextToken(TOK_IDENTIFIER);
+      p.SetAttributes(CurrentAttributes);
+      ItemsForNextBackComment.ClearAndAdd(P);
+      R.Fields.Add(p);
+    end;
+
+    FreeAndNil(t);
+
+    GetAndCheckNextToken(KEY_OF);
+
+    CurrentAttributes.Clear;
+    OldAttribPossible := AttributeIsPossible;
+    AttributeIsPossible := False;
+
+    { no support for attributes in case record, if found, unexpected behaviour }
+    t := GetNextToken;
+    LNeedId := True;
+    repeat
+      while true do
+      begin
+        case t.MyType of
+          TOK_SYMBOL:
+            begin
+              case t.Info.SymbolType of
+                SYM_COLON: break;
+                SYM_COMMA: LNeedId := True;
+              end;
+            end;
+          TOK_IDENTIFIER,
+          TOK_NUMBER:
+            if not LNeedId then
+              DoError('Unexpected %s', [t.Description]);
+
+          TOK_KEYWORD:
+            begin
+              if not (t.Info.KeyWord in [KEY_OR, KEY_AND]) then
+                DoError('Unexpected %s', [t.Description]);
+            end;
+          else // case
+            DoError('Unexpected %s', [t.Description]);
+        end; // case
+        FreeAndNil(t);
+        t := GetNextToken;
+      end;
+      // read all identifiers before colon
+
+      FreeAndNil(t);
+
+      GetAndCheckNextToken(SYM_LEFT_PARENTHESIS);
+
+      while not PeekNextToken.IsSymbol(SYM_RIGHT_PARENTHESIS) do
+      begin
+        if PeekNextToken.IsKeyWord(KEY_CASE) then
+        begin
+          GetNextToken.Free; { consume and free "case" token }
+          ParseRecordCase(R, true);
+        end else
+          ParseFieldsVariables(R.Fields, true, viPublic, true);
+      end;
+
+      GetNextToken.Free; // free ')' token
+
+      t := GetNextToken;
+      if t.IsSymbol(SYM_SEMICOLON) then
+      begin
+        FreeAndNil(t);
+        t := GetNextToken;
+      end;
+
+    until t.IsKeyWord(KEY_END) or
+      (SubCase and t.IsSymbol(SYM_RIGHT_PARENTHESIS));
+
+    AttributeIsPossible := OldAttribPossible;
+
+    Scanner.UnGetToken(t);
+  except
+    t.Free;
+    raise;
+  end;
+end;
+
+procedure TParser.ParseType(const U: TPasUnit; const CioState: TCioState);
+
+  { Call either ParseCio_StartDeclaration or ParseCio according to whether
+    we are parsing a CIO member (type nested in CIO) or not (global type). }
+  procedure DoCioParse(const U: TPasUnit;
+    const CioName, CioNameWithGeneric: string; const CIOType: TCIOType;
+    const RawDescriptionInfo: TRawDescriptionInfo;
+    const IsInRecordCase: Boolean);
+  begin
+    if CioState <> nil then
+      ParseCio_StartDeclaration(U, CioName, CioNameWithGeneric, CIOType, RawDescriptionInfo, IsInRecordCase)
+    else
+      ParseCio(U, CioName, CioNameWithGeneric, CIOType, RawDescriptionInfo, IsInRecordCase);
+  end;
+
+  { Add type to either unit or CIO, depending on CioState.
+    Note that this may free T, so don't use it afterwards. }
+  procedure DoAddType(var T: TPasItem);
+  begin
+    if CioState <> nil then
+    begin
+      if CioState.Visibility in ShowVisibilities then
+      begin
+        T.Visibility := CioState.Visibility;
+        CioState.Cio.Types.Add(T);
+      end else
+        FreeAndNil(T);
+    end else
+    if U <> nil then
+      U.AddType(T)
+    else
+      FreeAndNil(T);
+  end;
+
+  procedure TryPromoteToWeakTypeAlias(var P: TPasType);
+
+    {$ifndef FPC}
+    { Trim from the right side of S all characters from CharSet.
+      Delphi doesn't have this in standard library. }
+    function TrimRightSet(const S: string; const CharSet: TSysCharSet): string;
+    var
+      L: Integer;
+    begin
+      L := Length(S);
+      while (L > 0) and CharInSet(S[L], CharSet) do
+        Dec(L);
+      Result := Copy(S, 1, L);
+    end;
+    {$endif}
+
+  var
+    MaybeAliasName: String;
+    WeakAliasType: TPasAliasType;
+    EqualPos: Integer;
+  begin
+    EqualPos := Pos('=', P.FullDeclaration);
+    if EqualPos = 0 then Exit;
+
+    MaybeAliasName := SEnding(P.FullDeclaration, EqualPos + 1);
+    MaybeAliasName := TrimLeft(MaybeAliasName);
+    MaybeAliasName := TrimRightSet(MaybeAliasName, WhiteSpace + [';']);
+
+    if IsValidMultipartName(MaybeAliasName) then
+    begin
+      WeakAliasType := TPasAliasType.Create;
+      with WeakAliasType do
+      begin
+        // copy properties
+        Name := P.Name;
+        FullDeclaration:= P.FullDeclaration;
+        SourceLine := P.SourceLine;
+        SourceRootLine := P.SourceRootLine;
+        SourceAbsoluteFileName := P.SourceAbsoluteFileName;
+        RawDescriptionInfo^ := P.RawDescriptionInfo^;
+        DeprecatedNote:= P.DeprecatedNote;
+        HintDirectives:= P.HintDirectives;
+
+        IsStrongAlias:= false;
+        AliasedName:= MaybeAliasName;
+      end;
+      P.Free;
+      P := WeakAliasType;
+    end;
+  end;
+
+var
+  RawDescriptionInfo: TRawDescriptionInfo;
+  NormalType: TPasType;
+  TypeName: string;
+  LCollected, LTemp, TypeNameWithGeneric: string;
+  RoutineType: TPasRoutine;
+  EnumType: TPasEnum;
+  AliasType: TPasAliasType;
+  T, T2: TToken;
+  IsGeneric: boolean;
+  TypeDeclarationLine, TypeDeclarationRootLine: Integer;
+  TypeDeclarationFile: string;
+  CioType: TCIOType;
+begin
+  { Read the type name, preceded by optional "generic" directive.
+    Calculate TypeName, IsGeneric, TypeNameWithGeneric.
+    FPC ObjFpc mode requires "generic" directive,
+    but Delphi (and FPC Delphi mode) don't,
+    so it's just optional for us (serves for some checks later). }
+  T := GetNextToken;
+  try
+    TypeNameWithGeneric := '';
+    IsGeneric := T.IsStandardDirective(SD_GENERIC);
+    if IsGeneric then
+    begin
+      TypeNameWithGeneric := T.Data + ' ';
+      TypeName := GetAndCheckNextToken(TOK_IDENTIFIER);
+    end else
+    begin
+      CheckToken(T, TOK_IDENTIFIER);
+      TypeName := T.Data;
+    end;
+    TypeNameWithGeneric := TypeNameWithGeneric + TypeName;
+    Scanner.DeclareIdentifier(TypeName);
+
+    FLastParsedTokenStreamAbsoluteFileName := T.StreamAbsoluteFileName;
+    FLastParsedTokenLine := T.Line;
+    FLastParsedTokenRootLine := T.RootLine;
+  finally FreeAndNil(T) end;
+
+  TypeDeclarationLine:=FLastParsedTokenLine;
+  TypeDeclarationRootLine:=FLastParsedTokenRootLine;
+  TypeDeclarationFile:=FLastParsedTokenStreamAbsoluteFileName;
+  FTypeDeclarationLine:=TypeDeclarationLine;
+  FTypeDeclarationRootLine:=TypeDeclarationRootLine;
+  FTypeDeclarationFile:=TypeDeclarationFile;
+  DoMessage(5, pmtInformation, 'Parsing type "%s"', [TypeName]);
+
+  RawDescriptionInfo := GetLastComment;
+  AttributeIsPossible := False;
+  t := GetNextToken(LCollected);
+  try
+    if T.IsSymbol(SYM_LESS_THAN) then
+    begin
+      ParseGenericTypeIdentifierList(T, TypeNameWithGeneric);
+      T := GetNextToken(LCollected);
+    end;
+
+    if T.IsSymbol(SYM_SEMICOLON) then
+    begin
+      FreeAndNil(T);
+      Exit;
+    end else
+    if T.IsSymbol(SYM_EQUAL) then
+    begin
+      LCollected := TypeNameWithGeneric + LCollected + T.Data;
+      FreeAndNil(T);
+    end else
+    begin
+      FreeAndNil(T);
+      DoError('Symbol "=" expected', []);
+    end;
+
+    t := GetNextToken(LTemp);
+    LCollected := LCollected + LTemp + t.Data;
+
+    if (t.MyType = TOK_KEYWORD) then
+      case t.Info.KeyWord of
+        KEY_CLASS, KEY_OBJCCLASS:
+          begin
+            CioType := KeyWordToCioType(t.Info.KeyWord, False);
+            FreeAndNil(t);
+            t := GetNextToken(LTemp);
+            LCollected := LCollected + LTemp + t.Data;
+            if t.IsKeyWord(KEY_OF) then
+            begin
+              { include "identifier = class of something;" as standard type }
+            end else begin
+              Scanner.UnGetToken(t);
+              DoCioParse(U, TypeName, TypeNameWithGeneric, CioType,
+                RawDescriptionInfo, False);
+              Exit;
+            end;
+          end;
+        KEY_DISPINTERFACE,
+        KEY_INTERFACE,
+        KEY_OBJECT,
+        KEY_RECORD:
+          begin
+            CioType := KeyWordToCioType(t.Info.KeyWord, False);
+            DoCioParse(U, TypeName, TypeNameWithGeneric, CioType,
+              RawDescriptionInfo, False);
+            FreeAndNil(t);
+            Exit;
+          end;
+        KEY_TYPE: begin
+            T2 := PeekNextToken(LTemp);
+            if T2.IsStandardDirective(SD_HELPER) then
+            begin
+              DoCioParse(U, TypeName, TypeNameWithGeneric, CIO_TYPE,
+                RawDescriptionInfo, False);
+              FreeAndNil(t);
+              exit;
+            end else
+            begin
+              FreeAndNil(t);
+              ParseStrongTypeAlias(AliasType, TypeName, RawDescriptionInfo);
+              DoAddType(TPasItem(AliasType));
+              if CioState <> nil then
+                ParseCio_SkipDeclaration(U, RawDescriptionInfo, False);
+              exit;
+            end;
+          end;
+        KEY_PACKED:
+          begin
+            FreeAndNil(t);
+            t := GetNextToken(LTemp);
+            LCollected := LCollected + LTemp + t.Data;
+            if t.Info.KeyWord in [KEY_RECORD, KEY_OBJECT, KEY_CLASS, KEY_OBJCCLASS] then
+            begin
+              // for class - no check for "of", no packed classpointers allowed
+              CioType := KeyWordToCioType(t.Info.KeyWord, True);
+              DoCioParse(U, TypeName, TypeNameWithGeneric, CioType,
+                RawDescriptionInfo, False);
+              FreeAndNil(t);
+              Exit;
+            end;
+          end;
+      end;
+    if Assigned(t) then
+    begin
+      if (t.MyType = TOK_KEYWORD) then
+      begin
+        if t.Info.KeyWord in [KEY_FUNCTION, KEY_PROCEDURE] then
+        begin
+          ParseRoutine(RoutineType, '', t.Data, KeyWordToRoutineType(t.Info.KeyWord),
+            RawDescriptionInfo, false, true, '');
+          RoutineType.Name := TypeName;
+          RoutineType.SourceLine := TypeDeclarationLine;
+          RoutineType.SourceRootLine := TypeDeclarationRootLine;
+          RoutineType.SourceAbsoluteFileName := TypeDeclarationFile;
+          RoutineType.FullDeclaration :=
+            TypeName + ' = ' + RoutineType.FullDeclaration;
+          RoutineType.IsType := true;
+          DoAddType(TPasItem(RoutineType));
+          FreeAndNil(t);
+          if CioState <> nil then
+            ParseCio_SkipDeclaration(U, RawDescriptionInfo, False);
+          Exit;
+        end;
+      end;
+      if t.IsSymbol(SYM_LEFT_PARENTHESIS) then
+      begin
+        ParseEnum(EnumType, TypeName, RawDescriptionInfo);
+        EnumType.SourceAbsoluteFileName := FLastParsedTokenStreamAbsoluteFileName;
+        EnumType.SourceLine := TypeDeclarationLine;
+        EnumType.SourceRootLine := TypeDeclarationRootLine;
+        DoAddType(TPasItem(EnumType));
+        FreeAndNil(t);
+        if CioState <> nil then
+          ParseCio_SkipDeclaration(U, RawDescriptionInfo, False);
+        Exit;
+      end;
+      SetLength(LCollected, Length(LCollected)-Length(t.Data));
+      Scanner.UnGetToken(t);
+    end;
+    FreeAndNil(t);
+
+    AttributeIsPossible := True;
+
+    NormalType := TPasType.Create;
+    NormalType.FullDeclaration := LCollected;
+    SkipDeclaration(NormalType, false);
+    NormalType.Name := TypeName;
+    TryPromoteToWeakTypeAlias(NormalType);
+    NormalType.SourceAbsoluteFileName := FLastParsedTokenStreamAbsoluteFileName;
+    NormalType.SourceLine := FLastParsedTokenLine;
+    NormalType.SourceRootLine := FLastParsedTokenRootLine;
+    NormalType.RawDescriptionInfo^ := RawDescriptionInfo;
+    NormalType.SetAttributes(CurrentAttributes);
+    ItemsForNextBackComment.ClearAndAdd(NormalType);
+    DoAddType(TPasItem(NormalType));
+
+    if CioState <> nil then
+      ParseCio_SkipDeclaration(U, RawDescriptionInfo, False);
+  except
+    FreeAndNil(t);
+    raise;
+  end;
+end;
+
+{ ---------------------------------------------------------------------------- }
+
+procedure TParser.ParseUnit(U: TPasUnit);
+begin
+  GetAndCheckNextToken(KEY_UNIT);
+  U.RawDescriptionInfo^ := GetLastComment;
+
+  { get unit name identifier }
+  U.Name := ParseQualifiedIdentifier;
+  U.SourceAbsoluteFileName := FLastParsedTokenStreamAbsoluteFileName;
+  U.SourceLine := FLastParsedTokenLine;
+    U.SourceRootLine := FLastParsedTokenRootLine;
+
+  ItemsForNextBackComment.ClearAndAdd(U);
+
+  ParseHintDirectives(U);
+
+  { skip semicolon }
+  GetAndCheckNextToken(SYM_SEMICOLON);
+
+  { get 'interface' keyword }
+  GetAndCheckNextToken(KEY_INTERFACE);
+
+  { now parse the interface section of that unit }
+  ParseInterfaceSection(U);
+
+  { get 'implementation' keyword }
+  GetAndCheckNextToken(KEY_IMPLEMENTATION);
+
+  { now parse the implementation section of that unit }
+  ParseImplementationSection(U);
+end;
+
+{ ---------------------------------------------------------------------------- }
+procedure TParser.ParseProgramOrLibraryUses(U: TPasUnit);
+var
+  T: TToken;
+begin
+  U.RawDescriptionInfo^ := GetLastComment;
+
+  { get program/library name identifier }
+  U.Name := GetAndCheckNextToken(TOK_IDENTIFIER);
+  U.SourceAbsoluteFileName := FLastParsedTokenStreamAbsoluteFileName;
+  U.SourceLine := FLastParsedTokenLine;
+    U.SourceRootLine := FLastParsedTokenRootLine;
+
+  ItemsForNextBackComment.ClearAndAdd(U);
+
+  ParseHintDirectives(U);
+
+  { skip semicolon }
+  GetAndCheckNextToken(SYM_SEMICOLON);
+
+  T := GetNextToken;
+  try
+    if T.IsKeyWord(KEY_USES) then
+      ParseUses(U);
+  finally
+    FreeAndNil(T);
+  end;
+end;
+
+procedure TParser.ParseProgram(U: TPasUnit);
+begin
+  GetAndCheckNextToken(KEY_PROGRAM);
+  ParseProgramOrLibraryUses(U);
+end;
+
+procedure TParser.ParseLibrary(U: TPasUnit);
+begin
+  GetAndCheckNextToken(KEY_LIBRARY);
+  ParseProgramOrLibraryUses(U);
+end;
+
+procedure TParser.AddDirectives(const Directives: TStringVector);
+const
+  MacroSeparator = ':=';
+var
+  D: string;
+  IndexMacroSeparator: NativeInt;
+begin
+  for D in Directives do
+  begin
+    IndexMacroSeparator := Pos(MacroSeparator, D);
+    if IndexMacroSeparator > 0 then
+    begin
+      Scanner.AddMacro(Copy(D, 1, IndexMacroSeparator - 1),
+        SEnding(D, IndexMacroSeparator + Length(MacroSeparator)));
+    end else
+      Scanner.AddSymbol(D);
+  end;
+end;
+
+{ ---------------------------------------------------------------------------- }
+
+procedure TParser.ParseUnitOrProgram(var U: TPasUnit);
+var
+  t: TToken;
+  PreviousExitCode: Integer;
+begin
+  U := TPasUnit.Create;
+  FTodoUnit := U;
+  try
+    t := PeekNextToken;
+    CheckToken(t, TOK_KEYWORD);
+    case t.Info.KeyWord of
+      KEY_UNIT:
+        begin
+          U.IsUnit := True;
+          ParseUnit(U);
+        end;
+      KEY_PROGRAM:
+        begin
+          U.IsProgram := True;
+          ParseProgram(U);
+        end;
+      KEY_LIBRARY:
+        ParseLibrary(U);
+      else
+        DoError(SExpectedButFound,
+          [Format('one of reserved words "%s", "%s" or "%s"',
+            [LowerCase(KeyWordArray[KEY_UNIT]), LowerCase(KeyWordArray[KEY_LIBRARY]), LowerCase(KeyWordArray[KEY_PROGRAM])]),
+          T.Description]);
+    end;
+    if FInfoMergeType <> imtNone then
+    begin
+      // Declaration parsing stops at initialization or a program's main body.
+      // Still scan its active comments, including comments after the final dot.
+      // Lexical errors keep their normal failure result; only actual EOF ends it.
+      t := nil;
+      PreviousExitCode := System.ExitCode;
+      try
+        repeat
+          t := GetNextToken;
+          FreeAndNil(t);
+        until False;
+      except
+        // EPasDoc exceptions set System.ExitCode even when they are handled.
+        on E: ETokenizerStreamEnd do System.ExitCode := PreviousExitCode;
+      end;
+    end;
+  except
+    FTodoUnit := nil;
+    FreeAndNil(U);
+    raise;
+  end;
+  FTodoUnit := nil;
+end;
+
+{ ---------------------------------------------------------------------------- }
+
+procedure TParser.ParseUses(const U: TPasUnit);
+var
+  T: TToken;
+  UsedUnit: string;
+begin
+  { Parsing uses clause clears the comment, otherwise
+    - normal comments before "uses" clause would be assigned to normal unit
+      items (like a procedure), which is quite unexpected
+      (see ok_comment_over_uses_clause.pas testcase).
+    - analogously, back comments after "uses" clause would be assigned to the unit
+      description (see ok_comment_over_uses_clause_2.pas testcase).
+  }
+  IsLastComment := false;
+  ItemsForNextBackComment.Clear;
+
+  repeat
+    UsedUnit := ParseQualifiedIdentifier;
+    if U <> nil then
+      U.UsesUnits.Append(UsedUnit);
+
+    T := GetNextToken;
+    try
+      if T.IsKeyWord(KEY_IN) then
+      begin
+        FreeAndNil(T);
+
+        { Below we just ignore the value of next string token.
+
+          We can do this -- because PasDoc (at least for now)
+          does not recursively parse units on "uses" clause.
+          So we are not interested in the value of
+          given string (which should be a file-name (usually relative,
+          but absolute is also allowed AFAIK) with given unit.)
+
+          If we will ever want to implement such "recursive parsing
+          of units" in PasDoc, we will have to fix this to
+          *not* ignore value of token below. }
+        GetAndCheckNextToken(TOK_STRING);
+
+        T := GetNextToken;
+      end;
+
+      if T.IsSymbol(SYM_COMMA) then Continue else
+      if T.IsSymbol(SYM_SEMICOLON) then Break else
+        DoError('One of "," or ";" expected', []);
+    finally
+      FreeAndNil(T);
+    end;
+  until false;
+end;
+
+{ ---------------------------------------------------------------------------- }
+
+procedure TParser.ParseCommaSeparatedIdentifiers(Names: TStrings;
+  FinalSymbol: TSymbolType;
+  RawDescriptions: TRawDescriptionInfoList);
+var
+  T: TToken;
+  FirstIdentifier: boolean;
+begin
+  FirstIdentifier := true;
+
+  repeat
+    Names.Append(GetAndCheckNextToken(TOK_IDENTIFIER));
+
+    { Now we modify FirstIdentifier and append item to RawDescriptions }
+    if FirstIdentifier then
+    begin
+      FirstIdentifier := false;
+      if RawDescriptions <> nil then
+        RawDescriptions.Append(GetLastComment);
+    end else
+    if RawDescriptions <> nil then
+    begin
+      if IsLastComment then
+        RawDescriptions.Append(GetLastComment) else
+        RawDescriptions.Append(RawDescriptions[RawDescriptions.Count - 1]);
+    end;
+
+    T := GetNextToken;
+    try
+      if (T.MyType <> TOK_SYMBOL) or
+        ( (T.Info.SymbolType <> SYM_COMMA) and
+          (T.Info.SymbolType <> FinalSymbol) ) then
+        DoError('One of symbols "," or "%s" expected', [SymbolNames[FinalSymbol]]);
+      if T.Info.SymbolType = FinalSymbol then
+        break;
+    finally
+      FreeAndNil(T);
+    end;
+  until false;
+end;
+
+{ ---------------------------------------------------------------------------- }
+
+procedure TParser.ParseVariables(const U: TPasUnit);
+begin
+  if U <> nil then
+    ParseFieldsVariables(U.Variables, false, viPublished, false)
+  else
+    ParseFieldsVariables(nil, false, viPublished, false);
+end;
+
+procedure TParser.ParseFieldsVariables(Items: TPasItems;
+  OfObject: boolean; Visibility: TVisibility; IsInRecordCase: boolean;
+  const ClassKeyWordString: string = '');
+
+  // Parse variable/field modifiers in FPC.
+  // See: @url(http://www.freepascal.org/docs-html/ref/refse19.html FPC variable modifiers) for variable
+  // modifiers.
+  // This consumes some tokens and appends them to ItemCollector.FullDeclaration.
+  procedure ParseModifiers(ItemCollector: TPasFieldVariable);
+  const
+    Modifiers: array [boolean { OfObject }] of set of TStandardDirective =
+    ( ([SD_CVAR, SD_EXPORT, SD_EXTERNAL, SD_PUBLIC]),
+      ([SD_STATIC]) );
+  var
+    ModifierFound: Boolean;
+    SemicolonFound: boolean;
+    ttemp: TToken;
+  begin
+    repeat
+      ttemp := GetNextToken;
+      try
+        // The first token after the semicolon may be a variable or field modifier.
+        // If we see it, we eat it, up to the next semicolon.
+        // This does not take into account the "absolute" modifier
+        // (which is not preceeded by a semicolon).
+
+        ModifierFound :=
+          (ttemp.MyType = TOK_IDENTIFIER) and
+          (ttemp.Info.StandardDirective in Modifiers[OfObject]);
+
+        if ModifierFound then
+        begin
+          ItemCollector.FullDeclaration := ItemCollector.FullDeclaration +  ' ' + ttemp.Data;
+          FreeAndNil(ttemp);
+
+          { now eat tokens up to a ";" }
+          SemicolonFound := false;
+          while not SemicolonFound do
+          begin
+            ttemp := GetNextToken;
+            if ttemp.IsSymbol(SYM_SEMICOLON) then
+            begin
+              SemicolonFound := True;
+              ItemCollector.FullDeclaration := ItemCollector.FullDeclaration +  ttemp.Data;
+            end
+            else
+            begin
+              ItemCollector.FullDeclaration := ItemCollector.FullDeclaration +  ' ' + ttemp.Data;
+            end;
+            FreeAndNil(ttemp);
+          end;
+        end else
+          Scanner.UnGetToken(ttemp);
+      except
+        ttemp.Free;
+        raise;
+      end;
+    until not ModifierFound;
+  end;
+
+var
+  NewItem: TPasFieldVariable;
+  ItemCollector: TPasFieldVariable;
+  m: TPasRoutine;
+  t: TToken;
+  NewItemNames: TStringList;
+  I: Integer;
+  RawDescriptions: TRawDescriptionInfoList;
+  SavedStreamAbsoluteFileName: string;
+  SavedLine, SavedRootLine: Integer;
+  NewItems: TPasItems;
+begin
+  NewItemNames := nil;
+  RawDescriptions := nil;
+  NewItems := nil;
+  try
+    NewItemNames := TStringList.Create;
+    RawDescriptions := TRawDescriptionInfoList.Create;
+    { When Items = nil, we will gather NewItems only for internal use,
+      so we will free them ourselves. }
+    NewItems := TPasItems.Create(Items = nil);
+
+    // allow attributes for fields in classes
+    AttributeIsPossible := true;
+    ParseCommaSeparatedIdentifiers(NewItemNames, SYM_COLON, RawDescriptions);
+    SavedStreamAbsoluteFileName := FLastParsedTokenStreamAbsoluteFileName;
+    SavedLine := FLastParsedTokenLine;
+    SavedRootLine := FLastParsedTokenRootLine;
+
+    ItemCollector := TPasFieldVariable.Create;
+    try
+      ItemCollector.FullDeclaration := ':';
+      t := GetNextToken(ItemCollector);
+
+      { If symnbol is "(", we will later unget it and read it once again.
+        This way SkipDeclaration can read type declaration up to the matching
+        parenthesis, which is needed to handle fiels/var declarations with
+        inline enumareted type, like
+          var MyVar: (One, Two);
+      }
+      if not t.IsSymbol(SYM_LEFT_PARENTHESIS) then
+      begin
+        ItemCollector.FullDeclaration := ItemCollector.FullDeclaration + t.Data;
+      end;
+
+      if (t.MyType = TOK_KEYWORD) and
+         (t.Info.KeyWord in [KEY_FUNCTION, KEY_PROCEDURE]) then
+      begin
+        { RoutineTypeString for ParseRoutine below is '', because we already included
+          t.Data inside ItemCollector.FullDeclaration.
+          If RoutineTypeString would be t.Data, then we would incorrectly
+          append t.Data twice to ItemCollector.FullDeclaration
+          when appending m.FullDeclaration to ItemCollector.FullDeclaration.
+
+          Note that param InitItemsForNextBackComment for ParseRoutine
+          below is false. We will free M in the near time, and we don't
+          want M to grab back-comment intended for our fields. }
+        ParseRoutine(M, '', '', KeyWordToRoutineType(t.Info.KeyWord),
+          EmptyRawDescriptionInfo, false, false, '');
+        try
+          ItemCollector.FullDeclaration :=
+            ItemCollector.FullDeclaration + M.FullDeclaration;
+        finally
+          M.Free;
+        end;
+        FreeAndNil(t);
+        t := GetNextToken(ItemCollector);
+
+        if t.IsSymbol(SYM_EQUAL) then
+        begin
+          ItemCollector.FullDeclaration :=
+            ItemCollector.FullDeclaration + t.Data;
+          SkipDeclaration(ItemCollector, IsInRecordCase);
+        end else
+        begin
+          Scanner.UnGetToken(t);
+        end;
+      end else
+      if t.IsKeyWord(KEY_RECORD) then
+      begin
+        SkipDeclaration(ItemCollector,IsInRecordCase,1);
+      end else
+      if t.IsKeyWord(KEY_PACKED) then
+      begin
+        FreeAndNil(t);
+        t := GetNextToken;
+        if t.IsKeyWord(KEY_RECORD) then
+        begin
+          ItemCollector.FullDeclaration:=ItemCollector.FullDeclaration+' record';
+          SkipDeclaration(ItemCollector,IsInRecordCase,1);
+        end else
+        begin
+          SkipDeclaration(ItemCollector, IsInRecordCase);
+        end;
+      end else
+      begin
+        if t.IsSymbol(SYM_LEFT_PARENTHESIS) then
+        begin
+          Scanner.UnGetToken(t);
+        end;
+        SkipDeclaration(ItemCollector, IsInRecordCase);
+      end;
+
+      { Create and add (to Items and ItemsForNextBackComment and NewItems)
+        new items now.
+        We must do it, because we want to init ItemsForNextBackComment *now*,
+        not later (after ParseModifiers).
+        Otherwise we could accidentaly "miss"
+        some back-comment while searching for variable/field modifiers
+        in ParseModifiers.
+
+        Note that we have to set ItemsForNextBackComment regardless
+        of Items being nil or not. Items may be nil when caller is not interested
+        in gathering them, e.g. a private fields section.
+        Even in this case, we still want to capture back comments and assign them
+        to private fields (that will be thrown out later), instead of accidentally
+        assigning back comments to previous non-private item.
+        See tests/ok_back_comment_private.pas for example when this is important.
+
+        Note that when parsing variable modifiers, Get/PeekNextToken
+        inside may actually use ItemsForNextBackComment and clear it,
+        that's why we can't count on ItemsForNextBackComment to hold
+        all our new items and we have to use NewItems. }
+      ItemsForNextBackComment.Clear;
+      for I := 0 to NewItemNames.Count - 1 do
+      begin
+        NewItem := TPasFieldVariable.Create;
+        NewItem.Name := NewItemNames[I];
+        NewItem.SourceAbsoluteFileName := SavedStreamAbsoluteFileName;
+        NewItem.SourceLine := SavedLine;
+        NewItem.SourceRootLine := SavedRootLine;
+        NewItem.RawDescriptionInfo^ := RawDescriptions[I];
+        NewItem.Visibility := Visibility;
+        NewItem.SetAttributes(CurrentAttributes);
+        if Items <> nil then Items.Add(NewItem);
+        NewItems.Add(NewItem);
+        ItemsForNextBackComment.Add(NewItem);
+      end;
+      CurrentAttributes.Clear;
+
+      ParseModifiers(ItemCollector);
+
+      { Now, when whole parsing work is finished, finish initializing NewItems. }
+      if Items <> nil then
+      begin
+        for I := 0 to NewItems.Count - 1 do
+        begin
+          NewItem := NewItems[I] as TPasFieldVariable;
+          NewItem.FullDeclaration := NewItem.Name + ItemCollector.FullDeclaration;
+          if ClassKeyWordString <> '' then
+          begin
+            NewItem.FullDeclaration := ClassKeyWordString
+              + ' ' + NewItem.FullDeclaration;
+          end;
+          NewItem.HintDirectives := ItemCollector.HintDirectives;
+          NewItem.DeprecatedNote := ItemCollector.DeprecatedNote;
+        end;
+      end;
+    finally
+      ItemCollector.Free;
+      t.Free;
+    end;
+  finally
+    NewItemNames.Free;
+    RawDescriptions.Free;
+    NewItems.Free;
+  end;
+end;
+
+{ ---------------------------------------------------------------------------- }
+
+procedure TParser.SetCommentMarkers(const Value: TStringList);
+begin
+  FCommentMarkers.Assign(Value);
+end;
+
+procedure TParser.SetIgnoreMarkers(const Value: TStringList);
+begin
+  FIgnoreMarkers.Assign(Value);
+end;
+
+procedure TParser.SkipDeclaration(const Item: TPasItem; IsInRecordCase: boolean; const InitialEndLevel: Integer);
+var
+  EndLevel: Integer;
+  IsSemicolon: Boolean;
+  PLevel: Integer;
+  t: TToken;
+  WhitespaceCollectorToAdd: string;
+begin
+  EndLevel := InitialEndLevel;
+  PLevel := 0;
+  repeat
+    WhitespaceCollectorToAdd := '';
+    t := GetNextTokenNotAttribute(Item);
+    try
+      case t.MyType of
+        TOK_SYMBOL:
+          case t.Info.SymbolType of
+            SYM_LEFT_PARENTHESIS: Inc(PLevel);
+            SYM_RIGHT_PARENTHESIS: Dec(PLevel);
+          end;
+        TOK_KEYWORD:
+          case t.Info.KeyWord of
+            KEY_END: Dec(EndLevel);
+            KEY_RECORD: Inc(EndLevel);
+            KEY_LIBRARY:
+              if Assigned(Item) then
+                Item.HintDirectives := Item.HintDirectives + [hdLibrary];
+          end;
+        TOK_IDENTIFIER:
+          case t.Info.StandardDirective of
+            SD_PLATFORM:
+              if Assigned(Item) then
+                Item.HintDirectives := Item.HintDirectives + [hdPlatform];
+            SD_EXPERIMENTAL:
+              if Assigned(Item) then
+                Item.HintDirectives := Item.HintDirectives + [hdExperimental];
+            SD_UNIMPLEMENTED:
+              if Assigned(Item) then
+                Item.HintDirectives := Item.HintDirectives + [hdUnimplemented];
+            SD_DEPRECATED:
+              begin
+                if Assigned(Item) then
+                  Item.HintDirectives := Item.HintDirectives + [hdDeprecated];
+                while PeekNextToken(WhitespaceCollectorToAdd).MyType = TOK_STRING do
+                begin
+                  { consume the following string as DeprecatedNote }
+                  if Assigned(Item) then
+                    Item.FullDeclaration := Item.FullDeclaration + t.Data + WhitespaceCollectorToAdd;
+                  FreeAndNil(t);
+                  WhitespaceCollectorToAdd := '';
+                  t := GetNextTokenNotAttribute(Item);
+                  if Assigned(Item) then
+                  begin
+                    Assert(T.MyType = TOK_STRING); // T is now the same thing we saw with PeekNextToken
+                    Item.DeprecatedNote := Item.DeprecatedNote + t.StringContent;
+                  end;
+                end;
+              end;
+          end;
+      end;
+      IsSemicolon := t.IsSymbol(SYM_SEMICOLON);
+
+      { Reason for "EndLevel < 0" condition:
+          Within records et al. the last declaration need not be terminated by ;
+        Reason for "(PLevel < 0) and IsInRecordCase" condition:
+          See autodoc of SkipDeclaration in TParser interface. }
+      if (EndLevel < 0) or
+         ( (PLevel < 0) and IsInRecordCase ) then
+      begin
+        Scanner.UnGetToken(t);
+        Exit;
+      end;
+
+      if Assigned(Item) then Item.FullDeclaration := Item.FullDeclaration + t.Data + WhitespaceCollectorToAdd;
+
+      FreeAndNil(t);
+    except
+      t.Free;
+      raise;
+    end;
+  until IsSemicolon and (EndLevel = 0) and (PLevel = 0);
+end;
+
+{ ---------------------------------------------------------------------------- }
+
+function TParser.PeekNextToken(out WhitespaceCollector: string): TToken;
+
+  { Returns the offset of the next line in string S after position Index }
+  function FindNextLine(const S: string; Index: integer): integer;
+  begin
+    while SCharIs(S, Index, AllChars - WhiteSpaceNL) do Inc(Index);
+    while SCharIs(S, Index, WhiteSpaceNL) do Inc(Index);
+    if (Index > Length(S)) then
+      Result := 0
+    else
+      Result := Index;
+  end;
+
+  { Checks whether string S starts with sub-string SubS at Index.
+    Returns true is S starts with SubS, false otherwise. }
+  function SStartsWith(const S: string; Index: integer; const SubS: string): boolean;
+  var
+    I: integer;
+  begin
+    Result := false;
+
+    if Length(S) < Length(SubS) + Index - 1 then
+      Exit;
+
+    for I := 0 to Length(SubS)-1 do
+    begin
+      if S[Index + I] <> SubS[I+1] then
+        Exit;
+    end;
+
+    Result := true;
+  end;
+
+  { Extracts the documentation comment from T.CommentContent
+    (and some other T properties needed for TRawDescriptionInfo)
+    to CommentInfo. Always T.MyType must be within TokenCommentTypes.
+
+    T must not be nil.
+
+    The comment is intended to be a "documentation comment",
+    i.e. we intend to put it inside output documentation.
+    So comment markers, if present,
+    are removed from the beginning and end of the data.
+    Also, if comment markers were required but were not present,
+    then CommentInfo.Content is an empty string.
+
+    Also back-comment marker, the '<', is removed, if exists,
+    and BackComment is set to @true. Otherwise BackComment is @false. }
+  procedure ExtractDocComment(
+    const t: TToken; out CommentInfo: TRawDescriptionInfo;
+    out BackComment: boolean);
+  const
+    BackCommentMarker = '<';
+  var
+    i: integer;
+    Marker, BackText: string;
+    WasMarker: boolean;
+    CurPos: integer;
+  begin
+    BackComment := false;
+    CommentInfo.Content := T.CommentContent;
+    CommentInfo.StreamName := T.StreamName;
+    CommentInfo.BeginPosition := T.BeginPosition;
+    CommentInfo.EndPosition := T.EndPosition;
+
+    // Check if comment should be ignored
+    if IgnoreMarkers.Count <> 0 then
+    begin
+      for i := 0 to IgnoreMarkers.Count - 1 do
+        if IsPrefix(IgnoreMarkers[i], CommentInfo.Content) then
+        begin
+          CommentInfo.Content := '';
+          Exit;
+        end;
+    end;
+
+    if CommentMarkers.Count <> 0 then
+    begin
+      WasMarker := false;
+      for i := 0 to CommentMarkers.Count - 1 do
+      begin
+        Marker := CommentMarkers[i];
+        if IsPrefix(Marker, CommentInfo.Content) then
+        begin
+          Delete(CommentInfo.Content, 1, Length(Marker));
+          WasMarker := true;
+          Break;
+        end;
+      end;
+
+      if (not MarkersOptional) and (not WasMarker) then
+      begin
+        CommentInfo.Content := '';
+        Exit;
+      end;
+    end;
+
+    BackText:=CommentInfo.Content;
+    if (FBodyRoutine=nil) and SCharIs(BackText,1,BackCommentMarker) and
+      not SCharIs(BackText,2,['-','=']) and not
+      ((Length(BackText)>1) and (BackText[2]<>' ') and (Pos('>',BackText)>0)) then
+    begin
+      BackComment := true;
+      CommentInfo.Content:=BackText;
+      Delete(CommentInfo.Content, 1, Length(BackCommentMarker));
+    end;
+
+    { Remove leading characters }
+    if IgnoreLeading <> '' then
+    begin
+      CurPos := 1;
+      repeat
+        while SCharIs(CommentInfo.Content, CurPos, WhiteSpace) do Inc(CurPos);
+        while SStartsWith(CommentInfo.Content, CurPos, IgnoreLeading) do
+          Delete(CommentInfo.Content, CurPos, Length(IgnoreLeading));
+        CurPos := FindNextLine(CommentInfo.Content, CurPos);
+      until CurPos = 0;
+    end;
+  end;
+
+var
+  T: TToken;
+  TBackComment, TIsCStyle, THelpInsight: boolean;
+  TCommentInfo: TRawDescriptionInfo;
+  i: Integer;
+  name, value: string;
+  AttribPair: TStringPair;
+  innerBrackets: Integer;
+  parenthesis: Integer;
+  firstToken, WasLineFeed: Boolean;
+  TodoText: string;
+  SourceTodo: TPasSourceTodo;
+begin
+  Result := nil;
+  WhitespaceCollector := ''; WasLineFeed := False;
+  repeat
+    t := Scanner.PeekToken;
+    try
+      { when identifier is found, it cannot be attribute until next semicolon }
+      if T.MyType = TOK_IDENTIFIER then AttributeIsPossible := False;
+
+      if t.MyType = TOK_SYMBOL then
+      begin
+        if AttributeIsPossible and T.IsSymbol(SYM_LEFT_BRACKET) then begin
+          name := '';
+          value := '';
+          innerBrackets := 0;
+          parenthesis := 0;
+          firstToken := True;
+          repeat
+            Scanner.ConsumeToken;
+            FreeAndNil(T);
+            t := Scanner.PeekToken;
+            { first token is the attribute class, at this moment unevaluated }
+            if firstToken then begin
+              case t.MyType of
+              TOK_IDENTIFIER:
+                begin
+                  name := t.Data;
+                  firstToken := False;
+                end;
+              TOK_STRING:
+                begin
+                  { this is GUID, belongs to the interface, but no check for
+                  interface only is performed }
+                  name := 'GUID';
+                  value := '[' + t.Data + ']';
+                  firstToken := False;
+                end;
+              end;
+              continue;
+            end;
+
+            { check for start of attribute parameters }
+            { there might be more nested parenthesis }
+            if T.IsSymbol(SYM_LEFT_PARENTHESIS) then Inc(parenthesis);
+            if T.IsSymbol(SYM_RIGHT_PARENTHESIS) then begin
+              if parenthesis = 0 then DoError('parenthesis do not match.', []);
+              Dec(parenthesis);
+            end;
+
+            {there might be some square brackets used in attributes parameters,
+            ignore them, but count them (example: param is set)}
+            if T.IsSymbol(SYM_LEFT_BRACKET) then Inc(innerBrackets);
+            if T.IsSymbol(SYM_RIGHT_BRACKET) then begin
+              if innerBrackets > 0 then begin
+                Dec(innerBrackets);
+                value := value + t.Data;
+              end else Break;
+            end else begin
+              { there is list of attributes separated by coma }
+              if t.IsSymbol(SYM_COMMA) and (parenthesis = 0) then begin
+                AttribPair := TStringPair.Create(name, value);
+                CurrentAttributes.Add(AttribPair);
+                firstToken := True;
+                name := '';
+                value := '';
+              end else value := value + t.Data;  // anything other
+            end;
+          until False;
+
+          Scanner.ConsumeToken;
+          FreeAndNil(T);
+          AttribPair := TStringPair.Create(name, value);
+          CurrentAttributes.Add(AttribPair);
+        end else
+        begin
+          Result := t;
+          break;
+        end;
+      end else
+      if t.MyType in TokenCommentTypes then
+      begin
+        Scanner.ConsumeToken;
+
+        { Get info from T }
+        ExtractDocComment(T, TCommentInfo, TBackComment);
+        TodoText := Trim(TCommentInfo.Content);
+        if (FTodoUnit <> nil) and (Length(TodoText) >= 4) and
+          SameText(Copy(TodoText, 1, 4), 'TODO') and
+          ((Length(TodoText) = 4) or (TodoText[5] = ':') or
+           CharInSet(TodoText[5], [#9, #10, #13, ' '])) then
+        begin
+          SourceTodo := TPasSourceTodo.Create;
+          SourceTodo.Text := TodoText;
+          SourceTodo.SourceFile := T.StreamAbsoluteFileName;
+          SourceTodo.Line := T.Line;
+          SourceTodo.Owner := FTodoRoutine;
+          FTodoUnit.SourceTodos.Add(SourceTodo);
+          // Store once, independently of the ordinary documentation comment.
+          // The scanner has already excluded inactive conditional branches.
+          FreeAndNil(T);
+          Continue;
+        end;
+        TIsCStyle := (t.MyType in [TOK_COMMENT_CSTYLE, TOK_COMMENT_HELPINSIGHT]);
+        THelpInsight := t.MyType = TOK_COMMENT_HELPINSIGHT;
+
+        { Automatic back-comments.
+          The logic behind is following: this function stops at an identifier and
+          in the next call it will start from a whitespace if it's present and the
+          next token after a whitespace will be peeked inside the same loop.
+          So when we encounter //-style comment, we check if there was a whitespace
+          containing line feed. If yes, proceed as usual (comment is at a new line).
+          If no, the comment probably should be auto-back-ed. We check if there's
+          any items saved for next back comment and if they are, that's our case. }
+        if AutoBackComments then
+          if (t.MyType = TOK_COMMENT_CSTYLE) and not WasLineFeed and
+            (ItemsForNextBackComment.Count > 0) then
+            TBackComment := True;
+
+        FreeAndNil(T);
+
+        if TBackComment then
+        begin
+          if ItemsForNextBackComment.Count = 0 then
+            DoMessage(1, pmtWarning,
+              '%s: This is a back-comment (comment starting with "<") ' +
+              'but there is no item declared right before it: "%s"',
+              [Scanner.GetStreamInfo, TCommentInfo.Content]);
+
+          for i := 0 to ItemsForNextBackComment.Count - 1 do
+          begin
+            // use Trim(), see @url(https://sourceforge.net/p/pasdoc/bugs/89/ pasdoc bug 89)
+            if (Trim(ItemsForNextBackComment.PasItemAt[i].RawDescription)<>'') and
+              (Trim(ItemsForNextBackComment.PasItemAt[i].RawDescription)<>Trim(TCommentInfo.Content)) then
+              TCommentInfo.Content:=ItemsForNextBackComment.PasItemAt[i].RawDescription+LineEnding+TCommentInfo.Content;
+
+            ItemsForNextBackComment.PasItemAt[i].RawDescriptionInfo^ := TCommentInfo;
+          end;
+
+          ItemsForNextBackComment.Clear;
+        end else
+        if IsLastComment and LastCommentWasCStyle and TIsCStyle then
+        begin
+          { If there are several //-style comments in a row, combine them }
+          LastCommentInfo.Content := LastCommentInfo.Content +
+            LineEnding + TCommentInfo.Content;
+          if LastCommentInfo.StreamName = TCommentInfo.StreamName then
+            LastCommentInfo.EndPosition := TCommentInfo.EndPosition else
+            // ' ' is used to indicate that there is no
+            // single stream containing the entire comment.
+            LastCommentInfo.StreamName := ' ';
+        end else
+        begin
+          { This is a normal comment, so fill [Is]LastCommentXxx properties }
+          IsLastComment := true;
+          LastCommentWasCStyle := TIsCStyle;
+          LastCommentHelpInsight := THelpInsight;
+          LastCommentInfo := TCommentInfo;
+        end;
+      end else
+      if t.MyType = TOK_WHITESPACE then
+      begin
+        Scanner.ConsumeToken;
+        if (Pos(#10, t.Data) <> 0) or (Pos(#13, t.Data) <> 0) then
+          WasLineFeed := True;
+        WhitespaceCollector := WhitespaceCollector + t.Data;
+        FreeAndNil(t);
+      end else
+      begin
+        Result := t;
+        break;
+      end;
+    except
+      t.Free;
+      raise;
+    end;
+  until False;
+end;
+
+function TParser.PeekNextToken: TToken;
+var
+  Dummy: string;
+begin
+  Result := PeekNextToken(Dummy);
+end;
+
+function TParser.PeekNextToken(const WhitespaceCollectorItem: TPasItem): TToken;
+var
+  WhitespaceCollector: string;
+begin
+  Result := PeekNextToken(WhitespaceCollector);
+  if Assigned(WhitespaceCollectorItem) then
+    WhitespaceCollectorItem.FullDeclaration :=
+      WhitespaceCollectorItem.FullDeclaration + WhitespaceCollector;
+end;
+
+{ ------------------------------------------------------------ }
+
+procedure TParser.ParseHintDirectives(Item: TPasItem;
+  const ConsumeFollowingSemicolon: boolean; const ExtendFullDeclaration: boolean);
+var
+  T: TToken;
+  WasDeprecatedDirective: boolean;
+begin
+  repeat
+    WasDeprecatedDirective := false;
+    T := PeekNextToken;
+
+    if T.IsStandardDirective(SD_PLATFORM) then
+      Item.HintDirectives := Item.HintDirectives + [hdPlatform]
+    else
+    if T.IsStandardDirective(SD_EXPERIMENTAL) then
+      Item.HintDirectives := Item.HintDirectives + [hdExperimental]
+    else
+    if T.IsStandardDirective(SD_UNIMPLEMENTED) then
+      Item.HintDirectives := Item.HintDirectives + [hdUnimplemented]
+    else
+    if T.IsStandardDirective(SD_DEPRECATED) then
+    begin
+      Item.HintDirectives := Item.HintDirectives + [hdDeprecated];
+      WasDeprecatedDirective := true;
+    end else
+    if T.IsKeyWord(KEY_LIBRARY) then
+      Item.HintDirectives := Item.HintDirectives + [hdLibrary]
+    else
+      break;
+
+    if ExtendFullDeclaration then
+      Item.FullDeclaration := Item.FullDeclaration + ' ' + T.Data;
+    Scanner.ConsumeToken;
+    FreeAndNil(T);
+
+    if WasDeprecatedDirective then
+    begin
+      while PeekNextToken.MyType = TOK_STRING do
+      begin
+        T := PeekNextToken;
+        if ExtendFullDeclaration then
+          Item.FullDeclaration := Item.FullDeclaration + ' ' + T.Data;
+        Item.DeprecatedNote := Item.DeprecatedNote + T.StringContent;
+        Scanner.ConsumeToken;
+        FreeAndNil(T);
+      end;
+    end;
+
+    if ConsumeFollowingSemicolon then
+    begin
+      T := PeekNextToken;
+      if T.IsSymbol(SYM_SEMICOLON) then
+      begin
+        if ExtendFullDeclaration then
+          Item.FullDeclaration := Item.FullDeclaration + T.Data;
+        Scanner.ConsumeToken;
+        FreeAndNil(T);
+      end;
+    end;
+  until false;
+end;
+
+{ ------------------------------------------------------------ }
+
+function TParser.ParseCioMembers(const ACio: TPasCio; var Section: TParsingSection;
+  const IsInRecordCase: Boolean; var Visibility: TVisibility): Boolean;
+
+  { Parse fields clause, i.e. something like
+      NAME1, NAME2, ... : TYPE;
+    If AddToFields then adds parsed fields to i.Fields.
+    Visibility of created fields is set to given Visibility parameter. }
+  procedure ParseFields(AddToFields: Boolean;
+    Visibility: TVisibility; const ClassKeyWordString: string);
+  var Items: TPasItems;
+  begin
+    if AddToFields then
+      Items := ACio.Fields
+    else
+      Items := nil;
+
+    { Note: 4th arg for ParseFieldsVariables is always "false",
+      not "IsInRecordCase". That's because even if declaration
+      of this CIO is within a record case, then we want to
+      see record's terminating "end" keyword anyway.
+      So it doesn't matter here whether our IsInRecordCase
+      parameter is true. }
+    ParseFieldsVariables(Items, True, Visibility, False, ClassKeyWordString);
+  end;
+
+  // Adds `Item` to `Items` if it should be visible according to `Visibility`
+  // Clears back comments and frees the item otherwise
+  procedure AddItemIfVisible(var Item: TPasItem; Items: TPasItems; Visibility: TVisibility);
+  begin
+    if Visibility in ShowVisibilities then
+    begin
+      Item.MyUnit := ACio.MyUnit;
+      Item.MyObject := ACio;
+      Item.Visibility := Visibility;
+      Items.Add(Item);
+    end
+    else begin
+      ItemsForNextBackComment.Clear;
+      FreeAndNil(Item);
+    end;
+  end;
+
+var
+  ClassKeyWordString: string;
+  M: TPasRoutine;
+  ConstantParsed: TPasConstant;
+  p: TPasProperty;
+  StrictVisibility: Boolean;
+  t, t2: TToken;
+begin
+  t := nil;
+  try
+    { ClassKeyWordString is used to include 'class' in
+      class methods, properties and variables declarations. }
+    ClassKeyWordString := '';
+    StrictVisibility := False;
+    Result := False;
+    repeat
+      FreeAndNil(t);
+      { Attribute can be just in front of keyword or identifier }
+      AttributeIsPossible := True;
+      t := GetNextToken;
+      AttributeIsPossible := False;
+
+      if (t.IsSymbol(SYM_SEMICOLON)) then
+      begin
+        { A declaration of type "name = class(ancestor);" }
+        Scanner.UnGetToken(T);
+        Result := TRUE;
+        Break;
+      end
+      else if (t.MyType = TOK_KEYWORD) then
+      begin
+        Section := psNone;
+        if StrictVisibility then
+          DoError('"strict" found in an unexpected location', []);
+
+        case t.Info.KeyWord of
+          KEY_THREADVAR,
+          KEY_VAR:
+            begin
+              if ClassKeyWordString = '' then
+              begin
+                Section := psVar;
+                ClassKeyWordString := t.Data;
+                ParseFields(Visibility in ShowVisibilities, Visibility,
+                  ClassKeyWordString);
+                if not (Visibility in ShowVisibilities) then
+                  ItemsForNextBackComment.Clear;
+                ClassKeyWordString := '';
+              end
+              else
+                ClassKeyWordString := Trim(ClassKeyWordString + ' ' + t.Data);
+            end;
+          KEY_CLASS, KEY_OBJCCLASS: ClassKeyWordString := t.Data;
+          KEY_CONSTRUCTOR,
+          KEY_DESTRUCTOR,
+          KEY_FUNCTION,
+          KEY_PROCEDURE:
+            begin
+              ParseRoutine(M, ClassKeyWordString,
+                t.Data, KeyWordToRoutineType(t.Info.KeyWord),
+                GetLastComment, true, true, '');
+
+              ClassKeyWordString := '';
+              AddItemIfVisible(TPasItem(M), ACio.Methods, Visibility);
+            end;
+          KEY_END:
+            begin
+              ACio.SourceEndLine := t.Line;
+              Result := TRUE;
+              FreeAndNil(t);
+              Break;
+            end;
+          KEY_PROPERTY:
+            begin
+              ParseProperty(p);
+
+              { append ClassKeyWordString to property FullDeclaration,
+                to have 'class property Foo: ...'. }
+              if ClassKeyWordString <> '' then
+              begin
+                P.FullDeclaration := ClassKeyWordString + ' ' + P.FullDeclaration;
+                ClassKeyWordString := '';
+              end;
+
+              AddItemIfVisible(TPasItem(p), ACio.Properties, Visibility);
+            end;
+          KEY_CASE:
+            ParseRecordCase(ACio, False);
+          KEY_TYPE:
+            begin
+              Section := psType;
+              { Allow attribute (like [Align(8)]) before the first type name
+                in this nested type section. ParseType will consume it.
+                Testcase: tests/testcases/ok_attributes.pas }
+              AttributeIsPossible := True;
+              FreeAndNil(t);
+              Exit;
+            end;
+          KEY_CONST:
+            begin
+              Section := psConst;
+              FreeAndNil(t);
+              ParseConstant(ConstantParsed);
+              AddItemIfVisible(TPasItem(ConstantParsed), ACio.Constants, Visibility);
+            end;
+           else
+             DoError('Unexpected %s', [T.Description]);
+          end; // case
+      end
+      else if (t.MyType = TOK_IDENTIFIER) then
+      begin
+        case t.Info.StandardDirective of
+          SD_OPERATOR:
+            begin
+              { Same code as for KEY_CONSTRUCTOR, KEY_DESTRUCTOR,
+              KEY_FUNCTION, KEY_PROCEDURE above, something to be optimized. }
+              Section := psNone;
+              ParseRoutine(M, ClassKeyWordString, t.Data, ROUTINE_OPERATOR,
+                GetLastComment, true, true, '');
+              ClassKeyWordString := '';
+
+              AddItemIfVisible(TPasItem(M), ACio.Methods, Visibility);
+            end;
+          SD_DEFAULT:
+            begin
+              if StrictVisibility then
+                DoError('"strict" found in an unexpected location', []);
+
+              { Note: 2nd arg for SkipDeclaration is always "false",
+                not "IsInRecordCase". That's because even if declaration
+                of this CIO is within a record case, then we want to
+                see record's terminating "end" keyword anyway.
+                So it doesn't matter here whether our IsInRecordCase
+                parameter is true. }
+              SkipDeclaration(nil, false);
+              DoMessage(5, pmtInformation, 'Skipped default property keyword.', []);
+            end;
+          SD_PUBLIC:
+            begin
+              if StrictVisibility then
+                DoError('"strict" found in an unexpected location', []);
+
+              Visibility := viPublic;
+              Section := psNone;
+            end;
+          SD_PUBLISHED:
+            begin
+              if StrictVisibility then
+                DoError('"strict" found in an unexpected location', []);
+
+              Visibility := viPublished;
+              Section := psNone;
+            end;
+          SD_PRIVATE:
+            begin
+              if StrictVisibility then
+              begin
+                StrictVisibility := False;
+                Visibility := viStrictPrivate;
+              end
+              else
+                Visibility := viPrivate;
+              Section := psNone;
+            end;
+          SD_PROTECTED:
+            begin
+              if StrictVisibility then
+              begin
+                StrictVisibility := False;
+                Visibility := viStrictProtected;
+              end
+              else
+                Visibility := viProtected;
+              Section := psNone;
+            end;
+          SD_AUTOMATED:
+            begin
+              Visibility := viAutomated;
+              Section := psNone;
+            end;
+          SD_STRICT:
+            begin
+              StrictVisibility := True;
+              Section := psNone;
+            end;
+          SD_GENERIC:
+            begin
+              t2 := PeekNextToken;
+              { Handle "generic class procedure/function" }
+              if t2.IsKeyWord(KEY_CLASS) then
+              begin
+                Scanner.ConsumeToken;
+                ClassKeyWordString := t2.Data;
+                FreeAndNil(t2);
+                t2 := PeekNextToken;
+              end else
+                ClassKeyWordString := '';
+              if t2.Info.KeyWord in [KEY_FUNCTION, KEY_PROCEDURE] then
+              begin
+                 t2 := GetNextToken;
+                 try
+                   ParseRoutine(M, ClassKeyWordString,
+                     t2.Data, KeyWordToRoutineType(t2.Info.KeyWord),
+                     GetLastComment, true, true, t.Data);
+
+                   ClassKeyWordString := '';
+                   AddItemIfVisible(TPasItem(M), ACio.Methods, Visibility)
+                 finally
+                   FreeAndNil(t2)
+                 end
+              end
+              else
+                 DoError('Unexpected %s', [t2.Description])
+            end
+          else // case
+            Scanner.UnGetToken(T);
+            if Section = psType then
+              Exit;
+            if Section = psConst then
+            begin
+              ParseConstant(ConstantParsed);
+              AddItemIfVisible(TPasItem(ConstantParsed), ACio.Constants, Visibility);
+            end
+            else begin
+              ParseFields(Visibility in ShowVisibilities, Visibility,
+                ClassKeyWordString);
+              if not (Visibility in ShowVisibilities) then
+                ItemsForNextBackComment.Clear;
+              ClassKeyWordString := '';
+            end;
+        end; // case
+      end;
+      FreeAndNil(t);
+    until False;
+    CurrentAttributes.Clear;
+
+    ParseHintDirectives(ACio);
+
+    { Delphi supports "end align(N);" for record alignment.
+      Consume the align directive and its parenthesized argument. }
+    t := GetNextToken;
+    if (t.MyType = TOK_IDENTIFIER) and (LowerCase(t.Data) = 'align') then
+    begin
+      FreeAndNil(t);
+
+      GetAndCheckNextToken(SYM_LEFT_PARENTHESIS);
+
+      { Skip tokens until we find the closing parenthesis }
+      repeat
+        t := GetNextToken;
+        if t.IsSymbol(SYM_RIGHT_PARENTHESIS) then
+          Break;
+        FreeAndNil(t);
+      until false;
+
+      FreeAndNil(t);
+      t := GetNextToken;
+    end;
+
+    if not t.IsSymbol(SYM_SEMICOLON) then
+    begin
+      if IsInRecordCase then
+      begin
+        if t.IsSymbol(SYM_RIGHT_PARENTHESIS) then
+          Scanner.UnGetToken(t)
+        else
+          DoError('Unexpected symbol at end of sub-record', []);
+      end
+      else
+        DoError('Semicolon at the end of Class / Object / Interface' +
+          ' / Record expected', []);
+    end;
+  finally
+    t.Free;
+  end;
+end;
+
+{ ---------------------------------------------------------------------------- }
+
+procedure TParser.ParseGenericTypeIdentifierList(var T: TToken; var Content: string);
+var
+  Level: Cardinal;
+  EqualSignToken: TToken;
+begin
+  Content := Content + T.Data;
+  Level := 1;
+  repeat
+    FreeAndNil(T);
+    T := GetNextToken;
+    Content := Content + T.Data;
+    if T.IsSymbol(SYM_LESS_THAN) then
+      Inc(Level) else
+    if T.IsSymbol(SYM_GREATER_THAN) then
+      Dec(Level);
+    { Detect '>=' to close ParseGenericTypeIdentifierList,
+      which means we should consume > but leave = for later processing. }
+    if (Level = 1) and T.IsSymbol(SYM_GREATER_THAN_EQUAL) then
+    begin
+      SetLength(Content, Length(Content) - 1); { remove '=' from Content }
+      EqualSignToken := TToken.Create(TOK_SYMBOL);
+      EqualSignToken.Data := '=';
+      EqualSignToken.Info.SymbolType := SYM_EQUAL;
+      Scanner.UnGetToken(EqualSignToken);
+
+      // behave as if we just saw '>'
+      Dec(Level);
+    end;
+  until Level = 0;
+  FreeAndNil(T); { free last ">" }
+end;
+
+{ ---------------------------------------------------------------------------- }
+
+procedure TParser.ParseCioTypeDecl(out ACio: TPasCio;
+  const CioName, CioNameWithGeneric: string; const CIOType: TCIOType;
+  const RawDescriptionInfo: TRawDescriptionInfo; var Visibility: TVisibility);
+var
+  Finished: Boolean;
+  AncestorName, AncestorFullDeclaration: string;
+  t: TToken;
+begin
+  DoMessage(5, pmtInformation, 'Parsing class/interface/object "%s"', [CioNameWithGeneric]);
+  t := nil;
+  ACio := nil;
+  try
+    AttributeIsPossible := True;
+    t := GetNextToken;
+    AttributeIsPossible := False;
+
+    { Test for forward class definition here:
+        class MyClass = class;
+      with no ancestor or class members listed after the word class. }
+    if t.IsSymbol(SYM_SEMICOLON) then
+      // No error, continue the parsing.
+      Exit;
+
+    ACio := TPasCio.Create;
+    try
+      ACio.Name := CioName;
+      ACio.NameWithGeneric := CioNameWithGeneric;
+      ACio.SourceAbsoluteFileName := FTypeDeclarationFile;
+      ACio.SourceLine := FTypeDeclarationLine;
+      ACio.SourceRootLine := FTypeDeclarationRootLine;
+      ACio.RawDescriptionInfo^ := RawDescriptionInfo;
+      ACio.MyType := CIOType;
+
+      if t.IsStandardDirective(SD_ABSTRACT) then
+      begin
+        ACio.ClassDirective := CT_ABSTRACT;
+        FreeAndNil(t);
+        t := GetNextToken;
+      end else
+      if t.IsStandardDirective(SD_SEALED) then
+      begin
+        ACio.ClassDirective := CT_SEALED;
+        FreeAndNil(t);
+        t := GetNextToken;
+      end else
+      if t.IsStandardDirective(SD_HELPER) then
+      begin
+        { Class or record helpers are declared as:
+          identifierName = class|record helper [(ancestor list)] for TypeIdentifierName
+            memberList
+          end;
+
+          Ancestor list is optional, records cannot have ancestors, accepted nevertheless.
+        }
+        ACio.ClassDirective := CT_HELPER;
+        FreeAndNil(t);
+        t := GetNextToken;
+      end else
+      if t.IsStandardDirective(SD_EXTERNAL) then
+      begin
+        ACio.ClassDirective := CT_EXTERNAL;
+        FreeAndNil(t);
+        t := GetNextToken;
+      end;
+
+      { This allows to write back-comment for class declarations like
+          TMyClass = class(TMyAncestor) //< back comment
+      }
+      ItemsForNextBackComment.ClearAndAdd(ACio);
+
+      { If we have "(" then get all ancestors to ACio.Ancestors.
+        First one is a class ancestor, then implemented interfaces. }
+      if t.IsSymbol(SYM_LEFT_PARENTHESIS) then begin
+        FreeAndNil(t);
+        Finished := False;
+        { outer repeat loop: one ancestor per pass }
+        repeat
+          FreeAndNil(t);
+          t := GetNextToken;
+
+          if t.MyType = TOK_IDENTIFIER then { an ancestor }
+          begin
+            AncestorFullDeclaration := t.Data;
+            AncestorName := t.Data;
+
+            { For FPC-style generic specialization, the "specialize"
+              directive is specified before generic name.
+              That's easy to handle, just move to the next token. }
+            if t.IsStandardDirective(SD_SPECIALIZE) then
+            begin
+              FreeAndNil(t);
+              t := GetNextToken;
+              CheckToken(T, TOK_IDENTIFIER);
+              AncestorFullDeclaration := AncestorFullDeclaration + ' ' + t.Data;
+              AncestorName := t.Data; { previous AncestorName was wrong }
+            end;
+
+            { inner repeat loop: one part of the ancestor per name }
+            repeat
+              FreeAndNil(t);
+              t := GetNextToken;
+              if not t.IsSymbol(SYM_PERIOD) then
+              begin
+                Scanner.UnGetToken(t);
+                Break; { leave inner repeat loop }
+              end;
+              FreeAndNil(t);
+              t := GetNextToken;
+              if t.MyType <> TOK_IDENTIFIER then
+                DoError('Expected class, object or interface in ancestor' +
+                  ' declaration', []);
+
+              AncestorFullDeclaration := AncestorFullDeclaration + '.' + T.Data;
+              AncestorName            := AncestorName            + '.' + T.Data;
+            until False;
+
+            { Dumb reading of generic specialization, just blindly consume
+              (add to AncestorFullDeclaration) everything between <...>. }
+            t := GetNextToken;
+            if t.IsSymbol(SYM_LESS_THAN) then
+              ParseGenericTypeIdentifierList(T, AncestorFullDeclaration) else
+              Scanner.UnGetToken(t);
+
+            { This check secures from later problems (possible infinite loops when processing)
+              in case of tricky ancestors, like:
+
+              - "TMyClass = class(TMyClass)" (invalid code) or
+              - "TMyClass<T> = class(TMyClass)" (valid code as far as I know in Delphi,
+                and it's an unrelated error that for now we would consider it a loop at "TMyClass",
+                instead of treating generic and non-generic TMyClass as distinct).
+
+              PasDoc processes ancestors tree in a few places (like
+              TPasCio.FindItemInAncestors ,
+              TPasCio.GetInheritedItemDescriptions ,
+              WriteHierarchy in TGenericHTMLDocGenerator.WriteCIO ) and adding everywhere
+              a test to secure from it (e.g. check for maximum recursion depth)
+              would complicate that code a lot.
+              It is simpler to just avoiding creating an inheritance tree with loops here.
+
+              TODO: This doesn't secure from non-trivial loops, like
+
+                TMyClass2 = class;
+                TMyClass1 = class(TMyClass2);
+                TMyClass2 = class(TMyClass1);
+            }
+            if AncestorFullDeclaration = ACio.NameWithGeneric then
+              DoMessage(1, pmtWarning,
+                'Class or interface refers to itself as ancestor, ignoring to avoid infinite loops when traversing hierarchy: %s', [
+                ACio.Name
+              ])
+            else
+              ACio.Ancestors.Add(TStringPair.Create(AncestorName, AncestorFullDeclaration));
+          end
+          else begin
+            if (t.IsSymbol(SYM_COMMA)) then
+                { comma, separating two ancestors }
+              FreeAndNil(t)
+            else begin
+              CheckToken(t, SYM_RIGHT_PARENTHESIS);
+              FreeAndNil(t);
+              Finished := true;
+            end;
+          end;
+        until Finished;
+      end
+      else begin
+        Scanner.UnGetToken(t);
+        case ACio.MyType of
+          CIO_CLASS, CIO_PACKEDCLASS:
+            begin
+              if not SameText(ACio.Name, 'tobject') then
+                ACio.Ancestors.Add(TStringPair.Create('TObject', 'TObject'));
+            end;
+          CIO_OBJCCLASS, CIO_PACKEDOBJCCLASS:
+            begin
+              { No root class for objcclass, see
+                @url(https://wiki.freepascal.org/FPC_PasCocoa/Differences#No_unique_root_class FPC PasCocoa differences). }
+            end;
+          CIO_DISPINTERFACE:
+            begin
+              if not SameText(ACio.Name, 'idispinterface') then
+                ACio.Ancestors.Add(TStringPair.Create('IDispInterface', 'IDispInterface'));
+            end;
+          CIO_INTERFACE:
+            begin
+              if not SameText(ACio.Name, 'iinterface') then
+                ACio.Ancestors.Add(TStringPair.Create('IInterface', 'IInterface'));
+            end;
+          CIO_OBJECT, CIO_PACKEDOBJECT:
+            begin
+              if not SameText(ACio.Name, 'tobject') then
+              ACio.Ancestors.Add(TStringPair.Create('TObject', 'TObject'));
+            end;
+        end;
+      end;
+
+      if (CIOType in [ CIO_CLASS, CIO_RECORD, CIO_TYPE ]) and
+          (ACio.ClassDirective = CT_HELPER) then
+      begin
+        GetAndCheckNextToken(KEY_FOR);
+        ACio.HelperTypeIdentifier := ParseKnownTypeIdentifier;
+        if PeekNextToken.IsSymbol(SYM_LESS_THAN) then
+        begin
+          FreeAndNil(t);
+          t:=GetNextToken;
+          AncestorFullDeclaration:=ACio.HelperTypeIdentifier;
+          ParseGenericTypeIdentifierList(t,AncestorFullDeclaration);
+          ACio.HelperTypeIdentifier:=AncestorFullDeclaration;
+        end;
+      end;
+
+      if ACio.MyType in [ CIO_CLASS, CIO_PACKEDCLASS, CIO_OBJCCLASS, CIO_PACKEDOBJCCLASS ] then
+      begin
+        { Visibility of members at the beginning of a class declaration
+          that don't have a specified visibility is controlled
+          by ImplicitVisibility value. }
+        case ImplicitVisibility of
+          ivPublic:
+            if Scanner.SwitchOptions['M'] then
+              Visibility := viPublished
+            else
+              Visibility := viPublic;
+          ivPublished:
+            Visibility := viPublished;
+          ivImplicit:
+            Visibility := viImplicit;
+          else
+            raise EInternalParserError.Create('ImplicitVisibility = ??');
+        end;
+      end
+      else
+        { Everything besides a class always starts with visibility "public". }
+        Visibility := viPublic;
+
+      ACio.SetAttributes(CurrentAttributes);
+      { now collect methods, fields and properties }
+      { Flag is set when the class is finished     }
+      { Code moved to ParseCioMembers              }
+
+    except
+      FreeAndNil(ACio);
+      raise;
+    end;
+
+  finally
+    t.Free;
+  end;
+end;
+
+{ ---------------------------------------------------------------------------- }
+
+procedure TParser.ParseCio_StartDeclaration(const U: TPasUnit;
+  const CioName, CioNameWithGeneric: string;
+  const CIOType: TCIOType; const RawDescriptionInfo: TRawDescriptionInfo;
+  const IsInRecordCase: Boolean);
+var
+  LCio: TPasCio;
+  LVisibility: TVisibility;
+begin
+  ParseCioTypeDecl(LCio, CioName, CioNameWithGeneric, CioType,
+    RawDescriptionInfo, LVisibility);
+
+  if not Assigned(LCio) then // This is a forward declaration
+  begin
+    if FCioStack.Count > 0 then
+    begin
+      { Forward declaration within a nested type section.
+        Continue parsing the parent CIO. }
+      ParseCio_SkipDeclaration(U, RawDescriptionInfo, IsInRecordCase);
+    end;
+    Exit;
+  end;
+
+  ParseCio_Continue(U, LCio, psNone, LVisibility, IsInRecordCase);
+end;
+
+procedure TParser.ParseCio_SkipDeclaration(const U: TPasUnit;
+  const RawDescriptionInfo: TRawDescriptionInfo;
+  const IsInRecordCase: Boolean);
+var
+  LCio: TPasCio;
+  InitialSection: TParsingSection;
+  InitialVisibility: TVisibility;
+begin
+  // continue parsing the CIO, the one on top of stack
+  Assert(FCioStack.Count > 0);
+
+  LCio  := FCioStack.Peek.Cio;
+  InitialSection := FCioStack.Peek.Section;
+  InitialVisibility := FCioStack.Peek.Visibility;
+  FCioStack.Pop.Free;
+
+  ParseCio_Continue(U, LCio, InitialSection, InitialVisibility, IsInRecordCase);
+end;
+
+procedure TParser.ParseCio_Continue(const U: TPasUnit;
+  LCio: TPasCio;
+  LSection: TParsingSection;
+  LVisibility: TVisibility;
+  const IsInRecordCase: Boolean);
+var
+  CioState: TCioState;
+begin
+  Assert(Assigned(LCio));
+
+  while ParseCioMembers(LCio, LSection, IsInRecordCase, LVisibility) do
+  begin
+ // A Cio completed, nested or outer CIO
+    { Clear any orphan comments - do not let them break away from the CIO }
+    IsLastComment := false;
+    ItemsForNextBackComment.ClearAndAdd(LCio);
+    if (FCioStack.Count > 0) then
+    begin
+      LVisibility := FCioStack.Peek.Visibility;
+      if LVisibility in ShowVisibilities then
+      begin
+        LCio.Visibility := LVisibility;
+        FCioStack.Peek.Cio.Cios.Add(LCio);
+      end
+      else
+        FreeAndNil(LCio);
+      LCio := FCioStack.Peek.Cio;
+      LSection := FCioStack.Peek.Section;
+      FCioStack.Pop.Free;
+    end else
+    begin
+      if Assigned(U) then
+      begin
+        ItemsForNextBackComment.ClearAndAdd(LCio);
+        U.AddCIO(LCio);
+        LCio := nil;
+      end else
+        FreeAndNil(LCio);
+      Exit; // Finished
+    end;
+  end;
+
+  CioState := TCioState.Create;
+  CioState.Section := LSection;
+  CioState.Visibility := LVisibility;
+  CioState.Cio := LCio;
+  FCioStack.Push(CioState);
+
+  ParseType(U, CioState);
+end;
+
+{ TRawDescriptionInfoList ---------------------------------------------------- }
+
+function TRawDescriptionInfoList.GetItems(Index: integer): TRawDescriptionInfo;
+begin
+  { FItems is a dynarray, so compiler will automatically
+    add appropriate range checks here in $R+ mode.
+    So no need to explicitly check Index for validity here. }
+  Result := FItems[Index];
+end;
+
+procedure TRawDescriptionInfoList.Grow;
+var
+  Delta: integer;
+begin
+  if Length(FItems) < 16 then begin
+    Delta := 4;
+  end
+  else begin
+    Delta := Length(FItems) div 4;
+  end;
+  SetLength(FItems, Length(FItems) + Delta);
+end;
+
+function TRawDescriptionInfoList.Append(Comment: TRawDescriptionInfo): integer;
+begin
+  if Length(FItems) = Count then Grow;
+  FItems[Count] := Comment;
+  result := Count;
+  Inc(FCount);
+end;
+
+constructor TRawDescriptionInfoList.Create;
+begin
+  inherited;
+  SetLength(FItems, 4);
+  FCount := 0;
+end;
+
+{ TCioStateStack }
+
+procedure TCioStateStack.Clear;
+begin
+  while Count > 0 do
+    Pop.FreeAll;
+end;
+
+function TCioStateStack.Peek: TCioState;
+begin
+  Result := TCioState(inherited Peek);
+end;
+
+function TCioStateStack.Pop: TCioState;
+begin
+  Result := TCioState(inherited Pop);
+end;
+
+function TCioStateStack.Push(const Item: TCioState): TCioState;
+begin
+  Result := TCioState(inherited Push(Item));
+end;
+
+{ TCioState }
+
+procedure TCioState.FreeAll;
+begin
+  FCio.Free;
+  Destroy;
+end;
+
+end.
